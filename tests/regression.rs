@@ -1250,3 +1250,205 @@ fn teardown_removes_claude_md_it_created_and_keeps_user_owned_one() {
     run(&["teardown", "--session-id", "c3"]);
     assert_eq!(fs::read_to_string(&claude_md).unwrap(), "# mine\n");
 }
+
+// ════════════════════════════════════════════════════════════════ round 4 (pre-release)
+
+// ---------------------------------------------------------------- PR4-01
+
+/// Recursive content snapshot of a tree, skipping `.git` and the
+/// `.agent-profile` workspace (state/backups are gitignored bookkeeping).
+fn tree_snapshot(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn walk(root: &Path, dir: &Path, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let rel = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            if rel == ".git" || rel == ".agent-profile" {
+                continue;
+            }
+            if entry.file_type().unwrap().is_dir() {
+                walk(root, &path, out);
+            } else {
+                out.insert(rel, fs::read(&path).unwrap_or_default());
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(root, root, &mut out);
+    out
+}
+
+fn apply_two_teammates(sb: &Sandbox) {
+    for (role, session) in [("reviewer", "s1"), ("qa", "s2")] {
+        cmd(&sb.home)
+            .current_dir(&sb.repo)
+            .args([
+                "apply",
+                "--role",
+                role,
+                "--target",
+                "claude-teammate",
+                "--session-id",
+                session,
+            ])
+            .assert()
+            .code(0);
+    }
+}
+
+/// Two teammate sessions where the FIRST one created `.mcp.json` /
+/// `.claude/settings.local.json`: tearing the creator down first (FIFO) — or
+/// using `--all` — must end byte-clean, exactly like LIFO; no
+/// `{"mcpServers": {}}` / empty-permissions skeleton residue (§3.4: teardown
+/// restores the exact pre-apply state).
+#[test]
+fn multi_session_teardown_is_byte_clean_in_any_order() {
+    let orders: [&[&[&str]]; 3] = [
+        &[
+            &["teardown", "--session-id", "s1"],
+            &["teardown", "--session-id", "s2"],
+        ], // FIFO: creator first
+        &[
+            &["teardown", "--session-id", "s2"],
+            &["teardown", "--session-id", "s1"],
+        ], // LIFO
+        &[&["teardown", "--all"]],
+    ];
+    for (i, order) in orders.iter().enumerate() {
+        let sb = sandbox_with_examples();
+        let before = tree_snapshot(&sb.repo);
+        apply_two_teammates(&sb);
+        for args in order.iter() {
+            cmd(&sb.home)
+                .current_dir(&sb.repo)
+                .args(args.iter().copied())
+                .assert()
+                .code(0);
+        }
+        for residue in [".mcp.json", ".claude/settings.local.json", "CLAUDE.md"] {
+            assert!(
+                !sb.repo.join(residue).exists(),
+                "order {i}: tool-created {residue} left behind"
+            );
+        }
+        let after = tree_snapshot(&sb.repo);
+        assert_eq!(
+            before, after,
+            "order {i}: repo not byte-clean after teardown"
+        );
+    }
+}
+
+// ---------------------------------------------------------------- PR4-02
+
+/// Same creator-first teardown for the TOML merge path: two codex sessions
+/// share `~/.codex/config.toml` which the first one created — FIFO teardown
+/// must delete the emptied file, not leave a bare `[mcp_servers]` skeleton.
+#[test]
+fn fifo_teardown_of_codex_sessions_leaves_home_byte_clean() {
+    let sb = sandbox_with_examples();
+    let before = tree_snapshot(&sb.home);
+    for (role, session) in [("reviewer", "s1"), ("implementer", "s2")] {
+        cmd(&sb.home)
+            .current_dir(&sb.repo)
+            .args([
+                "apply",
+                "--role",
+                role,
+                "--target",
+                "codex-agent",
+                "--session-id",
+                session,
+            ])
+            .assert()
+            .code(0);
+    }
+    for session in ["s1", "s2"] {
+        cmd(&sb.home)
+            .current_dir(&sb.repo)
+            .args(["teardown", "--session-id", session])
+            .assert()
+            .code(0);
+    }
+    assert!(
+        !sb.home.join(".codex/config.toml").exists(),
+        "tool-created config.toml left behind after FIFO teardown"
+    );
+    assert_eq!(
+        before,
+        tree_snapshot(&sb.home),
+        "home not byte-clean after FIFO teardown"
+    );
+}
+
+// ---------------------------------------------------------------- PR4-03
+
+/// A user-pre-existing `.mcp.json` whose own (foreign) server is all that
+/// remains after both sessions tear down: the file must survive with exactly
+/// the user's content — foreign keys always do.
+#[test]
+fn teardown_keeps_user_preexisting_mcp_json_with_only_foreign_content() {
+    let sb = sandbox_with_examples();
+    let mcp = sb.repo.join(".mcp.json");
+    let user_content = "{\n  \"mcpServers\": {\n    \"my-own-server\": {\n      \"command\": \"my-cmd\"\n    }\n  }\n}\n";
+    write(&mcp, user_content);
+    apply_two_teammates(&sb);
+    for session in ["s1", "s2"] {
+        cmd(&sb.home)
+            .current_dir(&sb.repo)
+            .args(["teardown", "--session-id", session])
+            .assert()
+            .code(0);
+    }
+    let after = fs::read_to_string(&mcp).expect("user-pre-existing .mcp.json was deleted");
+    let v: serde_json::Value = serde_json::from_str(&after).unwrap();
+    assert_eq!(
+        v["mcpServers"]["my-own-server"]["command"], "my-cmd",
+        "foreign server lost: {after}"
+    );
+    assert!(
+        v["mcpServers"].get("github-readonly").is_none(),
+        "tool key survived teardown: {after}"
+    );
+}
+
+// ---------------------------------------------------------------- PR4-04
+
+/// A user-pre-existing file the tool merged into and then emptied of its own
+/// keys again must REMAIN on disk — only tool-created files are ever deleted,
+/// even when what is left is an empty skeleton the user owned all along.
+#[test]
+fn teardown_never_deletes_user_preexisting_file_even_when_emptied() {
+    let sb = sandbox_with_examples();
+    let settings = sb.repo.join(".claude/settings.local.json");
+    write(
+        &settings,
+        "{\n  \"permissions\": {\n    \"allow\": []\n  }\n}\n",
+    );
+    apply_two_teammates(&sb);
+    for session in ["s1", "s2"] {
+        cmd(&sb.home)
+            .current_dir(&sb.repo)
+            .args(["teardown", "--session-id", session])
+            .assert()
+            .code(0);
+    }
+    assert!(
+        settings.exists(),
+        "user-pre-existing settings.local.json was deleted by teardown"
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+    assert_eq!(
+        v["permissions"]["allow"],
+        serde_json::json!([]),
+        "user skeleton not restored"
+    );
+}

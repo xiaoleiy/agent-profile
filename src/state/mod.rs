@@ -84,6 +84,14 @@ pub struct ActionRecord {
     /// Set when `--force` overrode a drift refusal for this action (§5.1).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub forced: Option<bool>,
+    /// Merge-keys only: set when the target file, although it existed at this
+    /// apply (`hashBefore` present), owes its existence to this tool — an
+    /// earlier still-active session created it (its record has no
+    /// `hashBefore`, or carries this flag in turn). Teardown uses it so the
+    /// last session out deletes the emptied skeleton regardless of teardown
+    /// order (§3.4 reversibility: the repo ends byte-clean).
+    #[serde(rename = "fileCreated", skip_serializing_if = "Option::is_none")]
+    pub file_created: Option<bool>,
 }
 
 impl ActionRecord {
@@ -101,6 +109,7 @@ impl ActionRecord {
             appended: None,
             created_dirs: None,
             forced: None,
+            file_created: None,
         }
     }
 }
@@ -753,6 +762,18 @@ fn execute_one(
                 prior,
             ));
             record.hash_after = Some(sha256_of(&merged));
+            // The file pre-existed for *us*, but if a still-active session
+            // brought it into being (no hashBefore on its record, or an
+            // inherited flag), the file is tool-created: propagate that so
+            // whichever session leaves last can delete the emptied skeleton
+            // (FIFO/--all teardown leaves no `{}`-shaped residue).
+            if record.hash_before.is_some()
+                && prior
+                    .iter()
+                    .any(|r| r.hash_before.is_none() || r.file_created == Some(true))
+            {
+                record.file_created = Some(true);
+            }
             // §5.5 secret hygiene: persist the UNRESOLVED fragment (with the
             // `${env:VAR}` reference intact), never the materialized secret —
             // state.json is not guaranteed gitignored. The on-disk file (which
@@ -1080,14 +1101,14 @@ fn teardown_one(
                 },
                 Err(e) => return Err(e),
             };
-            let empty = if is_toml(&record.path) {
-                result.trim().is_empty()
-            } else {
-                serde_json::from_str::<serde_json::Value>(&result)
-                    .map(|v| v == serde_json::json!({}))
-                    .unwrap_or(result.trim().is_empty())
-            };
-            if record.hash_before.is_none() && empty {
+            // Delete (rather than rewrite) when the file owes its existence
+            // to this tool — this apply created it (no hashBefore) or a
+            // creating session propagated `fileCreated` (teardown-order
+            // independence) — and nothing but empty skeleton containers
+            // remains. A user-pre-existing file is never deleted, even when
+            // key removal empties it.
+            let tool_created = record.hash_before.is_none() || record.file_created == Some(true);
+            if tool_created && semantically_empty(&result, &record.path) {
                 std::fs::remove_file(abs).map_err(io_err(abs))?;
             } else if let Some(b) = &backup_text
                 && semantically_equal(&result, b, &record.path)
@@ -1141,6 +1162,40 @@ fn teardown_one(
         other => Err(Error::Session(format!(
             "state.json action has unknown op `{other}` — written by a newer agent-profile?"
         ))),
+    }
+}
+
+/// Is the document semantically empty — nothing left but empty skeleton
+/// containers (`{}`-valued objects / empty arrays in JSON, empty tables in
+/// TOML)? Key-level reversal cannot always prune containers that pre-existed
+/// *this* session's apply (an earlier session introduced them), so a
+/// tool-created file emptied of every value is deletable residue (§3.4).
+fn semantically_empty(text: &str, path: &str) -> bool {
+    if is_toml(path) {
+        text.trim().is_empty()
+            || text
+                .parse::<DocMut>()
+                .is_ok_and(|doc| toml_skeleton_only(doc.as_item()))
+    } else {
+        match serde_json::from_str::<serde_json::Value>(text) {
+            Ok(v) => json_skeleton_only(&v),
+            Err(_) => text.trim().is_empty(),
+        }
+    }
+}
+
+fn json_skeleton_only(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Object(map) => map.values().all(json_skeleton_only),
+        serde_json::Value::Array(arr) => arr.is_empty(),
+        _ => false,
+    }
+}
+
+fn toml_skeleton_only(item: &toml_edit::Item) -> bool {
+    match item.as_table_like() {
+        Some(t) => t.iter().all(|(_, v)| toml_skeleton_only(v)),
+        None => matches!(item, toml_edit::Item::None),
     }
 }
 

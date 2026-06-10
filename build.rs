@@ -13,5 +13,19 @@ fn main() {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=AGENT_PROFILE_GIT_SHA={sha}");
+    // Rebuild when HEAD moves. `.git/HEAD` alone only changes on checkout —
+    // a same-branch commit rewrites the resolved ref file instead, so track
+    // that too (or packed-refs when the loose ref file doesn't exist), else
+    // `--version` embeds a stale sha after committing on the same branch.
     println!("cargo:rerun-if-changed=.git/HEAD");
+    if let Ok(head) = std::fs::read_to_string(".git/HEAD")
+        && let Some(reference) = head.trim().strip_prefix("ref: ")
+    {
+        if std::path::Path::new(".git").join(reference).exists() {
+            println!("cargo:rerun-if-changed=.git/{reference}");
+        } else {
+            // Ref is packed (fresh clone / post-`git pack-refs`).
+            println!("cargo:rerun-if-changed=.git/packed-refs");
+        }
+    }
 }
