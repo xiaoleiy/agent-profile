@@ -112,6 +112,7 @@ mod tests {
         let ctx = PlanContext {
             scope: Scope::Repo,
             repo_root: PathBuf::from("/repo"),
+            workspace_root: PathBuf::from("/repo/.agent-profile"),
             home: home(),
             session_id: None,
         };
@@ -120,7 +121,7 @@ mod tests {
                 path: "~/.codex/auth.json".into(),
                 content: String::new(),
             }],
-            skipped: vec![],
+            ..Default::default()
         };
         let err = assert_plan_allowed(&plan, &ctx).unwrap_err();
         assert!(matches!(err, Error::NeverTouch { .. }));

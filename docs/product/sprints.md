@@ -190,3 +190,39 @@ steps beyond the tag push; probe scorecard live and dated.
   character-identical to the design's; tests assert the exact rule text. The
   golden test for §4.6 asserts file list, ops, and key names as specified
   (line counts naturally differ from the illustrative `(19 lines)`).
+
+- **S3-T3 "probe against the INSTALLED CLI"**: offline CLIs expose no
+  capability introspection, so probing is limited to `which` + `<cli>
+  --version` (parses the real `2.0.34 (Claude Code)` / `codex-cli 0.21.0`
+  output shapes). Field support itself comes from the in-crate
+  documented-version matrix (`src/doctor/matrix.rs`, update procedure in its
+  module comment), with the sprint-plan-sanctioned `--assume-version`
+  override when probing is unavailable. Missing binary → `F001` error
+  finding; unparseable version → `F002` warn and version-gated checks are
+  skipped rather than guessed.
+
+- **S3-T2 `permissions.defaultMode` values**: the design does not pin the
+  `permissionMode` → Claude `defaultMode` mapping. Chosen (documented in
+  `claude::default_mode`): `readonly`/`plan` → `"plan"` (Claude has no
+  readonly mode; the merged deny rules carry the read-only posture),
+  `acceptEdits` → `"acceptEdits"`, `auto` → `"auto"` (observed in the wild,
+  recon §1.2), `unrestricted` → `"bypassPermissions"`.
+
+- **S3-T2 teammate agent .md body**: per the §3.4 state example, context
+  fragments route exclusively to the CLAUDE.md marked block and skills to
+  symlinks, so the teammate-owned agent file body carries only the
+  provenance header (frontmatter as §3.1). The subagent target embeds
+  fragment contents + skill pointer lines per §3.1.
+
+- **S3-T2 "only added keys" in JSON diffs**: appending an entry to an
+  existing JSON array necessarily rewrites the previous last element's
+  trailing comma, so the unified diff shows that one line as `-`/`+` with
+  identical content. The merge itself is key-level and content-preserving
+  (`serde_json` with `preserve_order`); the test asserts no *content* is
+  removed.
+
+- **S3-T4 §4.3 reproduction**: the walkthrough's `F012`/`F031`/`F044`/`ok
+  skills: 2/2` lines are reproduced byte-for-byte in shape; doctor on the
+  examples `reviewer` additionally reports `model.effort` as not honored by
+  Claude targets (an honest finding the illustrative walkthrough omits) and
+  `F061` untranslatable-rule errors when the target is codex-agent.

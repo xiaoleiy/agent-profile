@@ -62,6 +62,9 @@ pub enum Error {
     #[error("failed to parse TOML at {path}: {message}")]
     TomlParse { path: PathBuf, message: String },
 
+    #[error("failed to parse JSON at {path}: {message}")]
+    JsonParse { path: PathBuf, message: String },
+
     #[error("refusing to touch never-touch path {path} (hardcoded denylist, design §5.1)")]
     NeverTouch { path: PathBuf },
 
@@ -87,6 +90,7 @@ impl Error {
             Error::Io { .. }
             | Error::NotImplemented
             | Error::TomlParse { .. }
+            | Error::JsonParse { .. }
             | Error::NeverTouch { .. } => ExitCode::Internal,
             Error::WorkspaceNotFound { .. }
             | Error::WorkspaceDirInvalid { .. }

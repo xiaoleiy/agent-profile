@@ -11,6 +11,7 @@ use serde::Serialize;
 
 use crate::JSON_SCHEMA_VERSION;
 use crate::adapters::{self, Action, Plan, PlanContext, Skipped};
+use crate::doctor;
 use crate::error::{Error, ExitCode};
 use crate::schema::types::Target;
 use crate::schema::validate::{self, UnitReport};
@@ -74,6 +75,10 @@ pub enum Command {
     Doctor {
         #[command(flatten)]
         role_target: RoleTargetArgs,
+        /// Assume this CLI version instead of probing `<cli> --version`
+        /// (checks run against the documented-version matrix).
+        #[arg(long = "assume-version", value_name = "X.Y[.Z]")]
+        assume_version: Option<doctor::Version>,
     },
     /// Dry-run by default: print planned files/merges.
     Render {
@@ -157,8 +162,11 @@ fn dispatch(cli: &Cli) -> Result<ExitCode, Error> {
             scope,
         } => cmd_render(cli, role_target, out.as_deref(), *scope),
         Command::Diff { role_target, scope } => cmd_diff(cli, role_target, *scope),
-        Command::Doctor { .. }
-        | Command::Apply { .. }
+        Command::Doctor {
+            role_target,
+            assume_version,
+        } => cmd_doctor(cli, role_target, *assume_version),
+        Command::Apply { .. }
         | Command::Teardown { .. }
         | Command::Current
         | Command::Completions { .. } => Err(Error::NotImplemented),
@@ -395,6 +403,7 @@ fn build_plan(
     let ctx = PlanContext {
         scope,
         repo_root,
+        workspace_root: ws.root().to_path_buf(),
         home,
         session_id: None,
     };
@@ -426,6 +435,9 @@ fn cmd_render(
             "actions": plan.actions,
             "skipped": plan.skipped,
         });
+        if !plan.notes.is_empty() {
+            envelope["notes"] = serde_json::json!(plan.notes);
+        }
         if let Some(dir) = out {
             envelope["outDir"] = serde_json::json!(dir.display().to_string());
         }
@@ -484,6 +496,9 @@ fn print_plan_human(plan: &Plan, written: Option<(&std::path::Path, usize)>) {
     for s in &plan.skipped {
         print_skipped(s);
     }
+    for note in &plan.notes {
+        println!("  note: {note}");
+    }
     match written {
         Some((_, n)) => println!("Wrote {n} rendered file{} (sandbox only).", plural(n)),
         None => println!(
@@ -505,13 +520,27 @@ fn cmd_diff(cli: &Cli, rt: &RoleTargetArgs, scope: Scope) -> Result<ExitCode, Er
     let mut diffs: Vec<(String, String)> = Vec::new();
     for action in &plan.actions {
         let abs = ctx.resolve(action.path());
-        let current = match std::fs::read_to_string(&abs) {
-            Ok(s) => Some(s),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(source) => return Err(Error::Io { path: abs, source }),
+        let (cur, desired) = match action {
+            // Symlinks diff on their target, not file contents.
+            Action::Symlink { link_target, .. } => {
+                let cur = match std::fs::read_link(&abs) {
+                    Ok(t) => symlink_repr(&abbreviate_home(&t, &ctx.home)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                    // Exists but is not a symlink — show it as drift.
+                    Err(_) => "(existing path is not a symlink)\n".to_string(),
+                };
+                (cur, symlink_repr(link_target))
+            }
+            _ => {
+                let current = match std::fs::read_to_string(&abs) {
+                    Ok(s) => Some(s),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(source) => return Err(Error::Io { path: abs, source }),
+                };
+                let desired = adapters::desired_file_state(action, current.as_deref())?;
+                (current.unwrap_or_default(), desired)
+            }
         };
-        let desired = adapters::desired_file_state(action, current.as_deref())?;
-        let cur = current.unwrap_or_default();
         if cur != desired {
             let text_diff = similar::TextDiff::from_lines(cur.as_str(), desired.as_str());
             let mut unified = text_diff.unified_diff();
@@ -541,5 +570,85 @@ fn cmd_diff(cli: &Cli, rt: &RoleTargetArgs, scope: Scope) -> Result<ExitCode, Er
         ExitCode::Success
     } else {
         ExitCode::Drift
+    })
+}
+
+fn symlink_repr(target: &str) -> String {
+    format!("symlink -> {target}\n")
+}
+
+fn abbreviate_home(path: &std::path::Path, home: &std::path::Path) -> String {
+    match path.strip_prefix(home) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+// ---------------------------------------------------------------- doctor
+
+fn cmd_doctor(
+    cli: &Cli,
+    rt: &RoleTargetArgs,
+    assume_version: Option<doctor::Version>,
+) -> Result<ExitCode, Error> {
+    let ws = workspace(cli)?;
+    let target = Target::parse(&rt.target).ok_or_else(|| Error::UnknownTarget {
+        target: rt.target.clone(),
+    })?;
+    let resolved = merge::resolve(&ws, &rt.role)?;
+    if !resolved.profile.targets.contains(&target) {
+        return Err(Error::TargetNotAllowed {
+            role: rt.role.clone(),
+            target: rt.target.clone(),
+        });
+    }
+    let home = std::env::home_dir().ok_or_else(|| Error::Io {
+        path: PathBuf::from("~"),
+        source: std::io::Error::other("cannot determine home directory"),
+    })?;
+    let env = doctor::Env {
+        home,
+        workspace_root: ws.root().to_path_buf(),
+        assume_version,
+    };
+    let report = doctor::run(&resolved, target, &env);
+
+    if cli.json {
+        let envelope = serde_json::json!({
+            "schemaVersion": JSON_SCHEMA_VERSION,
+            "role": rt.role,
+            "target": target.as_str(),
+            "cliVersion": report.cli_version.map(|v| v.to_string()),
+            "findings": report.findings,
+        });
+        println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
+    } else {
+        let shown = match (&report.cli_version, report.assumed) {
+            (Some(v), true) => format!("{v} (assumed)"),
+            (Some(v), false) => v.to_string(),
+            (None, _) => "(unknown)".to_string(),
+        };
+        println!("{} --version → {shown}", report.cli);
+        println!("FINDINGS");
+        if report.findings.is_empty() && report.ok.is_empty() {
+            println!("  (none)");
+        }
+        for f in &report.findings {
+            println!(
+                "  {:<5}  {}  {}",
+                f.level.as_str(),
+                f.code.as_str(),
+                f.message
+            );
+        }
+        for line in &report.ok {
+            println!("  {:<5}  {line}", "ok");
+        }
+    }
+    // Errors → exit 4; warnings/info alone → exit 0 (design §5.3).
+    Ok(if report.has_errors() {
+        ExitCode::Doctor
+    } else {
+        ExitCode::Success
     })
 }

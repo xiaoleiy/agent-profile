@@ -9,7 +9,8 @@ use std::collections::BTreeMap;
 use toml_edit::{Array, DocumentMut, Item, Table, value};
 
 use crate::adapters::{
-    Action, Plan, PlanContext, RenderTarget, Scope, Skipped, grammar, provenance_header_toml,
+    Action, Plan, PlanContext, RenderTarget, Scope, Skipped, block_marker, grammar, marked_block,
+    provenance_header_toml,
 };
 use crate::error::Error;
 use crate::schema::merge::ResolvedProfile;
@@ -50,10 +51,7 @@ impl RenderTarget for CodexAgent {
         }
 
         if let Some(context) = r.set.context.as_ref().filter(|c| !c.is_empty()) {
-            let marker = match &ctx.session_id {
-                Some(id) => format!("session={id}"),
-                None => format!("role={role}"),
-            };
+            let marker = block_marker(ctx, role);
             let path = match ctx.scope {
                 Scope::Repo => "AGENTS.md".to_string(),
                 Scope::User => "~/.codex/AGENTS.md".to_string(),
@@ -79,7 +77,11 @@ impl RenderTarget for CodexAgent {
             });
         }
 
-        Ok(Plan { actions, skipped })
+        Ok(Plan {
+            actions,
+            skipped,
+            notes: vec![],
+        })
     }
 }
 
@@ -199,22 +201,6 @@ fn mcp_fragment(servers: &BTreeMap<String, McpServer>) -> String {
         doc["mcp_servers"][name.as_str()] = Item::Table(t);
     }
     doc.to_string()
-}
-
-/// Marked `@include` stub block for AGENTS.md (design §3.2.5/§3.3.3).
-fn marked_block(marker: &str, role: &str, context: &[String]) -> String {
-    // When the marker is already role-based, do not repeat the role attr.
-    let role_attr = if marker.starts_with("role=") {
-        String::new()
-    } else {
-        format!(" role={role}")
-    };
-    let mut block = format!("<!-- agent-profile:begin {marker}{role_attr} -->\n");
-    for fragment in context {
-        block.push_str(&format!("@.agent-profile/{fragment}\n"));
-    }
-    block.push_str(&format!("<!-- agent-profile:end {marker} -->\n"));
-    block
 }
 
 /// Key-level merge of a TOML `fragment` into `current`, preserving comments,
@@ -368,6 +354,7 @@ mod tests {
         PlanContext {
             scope,
             repo_root: PathBuf::from("/repo"),
+            workspace_root: PathBuf::from("/repo/.agent-profile"),
             home: PathBuf::from("/home/u"),
             session_id: None,
         }
