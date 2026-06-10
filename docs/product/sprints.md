@@ -226,3 +226,48 @@ steps beyond the tag push; probe scorecard live and dated.
   examples `reviewer` additionally reports `model.effort` as not honored by
   Claude targets (an honest finding the illustrative walkthrough omits) and
   `F061` untranslatable-rule errors when the target is codex-agent.
+
+- **S4-T3 `apply --json` actions shape**: design §4.2 illustrates
+  `"actions":5` (a count) while §2 specifies "same [as render] plus …
+  per-action status". §2 wins: `apply --json` emits the render-shaped
+  `actions` array with a per-action `"status"` (`applied`/`unchanged`); the
+  count is the array length.
+
+- **S4-T3 §4.2 three-teammate-sessions in one repo**: roles whose
+  `permissionMode` maps to *different* `permissions.defaultMode` values
+  collide on that key under the normative §5.1 merge rule when applied to
+  `claude-teammate` in the same repo (the second apply is an exit-3 drift
+  refusal — correctly). The integration fixture therefore applies
+  reviewer+qa (both map to `"plan"`) to claude-teammate and implementer to
+  codex-agent. §4.2's own parenthetical (per-worker worktrees) dissolves the
+  collision in real orchestrator use.
+
+- **S4-T4 hash verification vs foreign-edit preservation**: §5.2 says "each
+  action's hashAfter re-verified; mismatch → refuse", but §3.4 requires
+  merge-keys teardown to *preserve* foreign changes and the S4-T4 acceptance
+  requires a foreign `.mcp.json` key added after apply to survive teardown.
+  Reconciliation implemented: `hashAfter` equality is the clean fast path;
+  on mismatch, `merge-keys` falls back to verifying that the exact keys we
+  wrote are still intact (changed → drift, removed-by-user → no-op, foreign
+  additions → fine); `create`/`symlink` stay strictly verified
+  (hash / link target); `append-block` is removed by marker "wherever it now
+  sits" (tolerant by §3.4's own wording).
+
+- **S4-T3 secret materialization scope**: per §5.5 only Claude `.mcp.json`
+  env maps materialize `${env:VAR}`; the codex `config.toml` merge writes the
+  reference verbatim (matches the §4.6 diff). The resolved fragment is also
+  recorded in the state.json action record (needed for key-level reversal and
+  drift verification) — state.json is required-gitignored alongside
+  `backups/` via the one-time hint, and the record is deleted on teardown,
+  so the hygiene story of §5.5 is preserved.
+
+- **S4-T2 pre-existing correct symlink**: a `.claude/skills/<s>` symlink that
+  already points at our target is treated as foreign (status `unchanged`,
+  not recorded in state, left in place at teardown) rather than drift —
+  removing a link we did not create would violate "restore the exact
+  pre-apply state".
+
+- **S4-T3 one-time gitignore hint**: printed to stderr (keeps `--json`
+  stdout parseable) and tracked via a `gitignoreHintShown` extension flag in
+  state.json (absent from the §3.4 example; skipped while false, so the
+  example round-trips verbatim).

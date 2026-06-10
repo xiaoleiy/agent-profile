@@ -300,6 +300,19 @@ pub fn merge_json_fragment(
     keys: &[String],
     path: &str,
 ) -> Result<String, Error> {
+    merge_json_fragment_with(current, fragment, keys, path, false)
+}
+
+/// [`merge_json_fragment`] with collision handling selectable: `force = true`
+/// makes our keys win on collision (apply `--force`, design §5.1) instead of
+/// returning a drift error.
+pub fn merge_json_fragment_with(
+    current: &str,
+    fragment: &str,
+    keys: &[String],
+    path: &str,
+    force: bool,
+) -> Result<String, Error> {
     let parse_err = |message: String| Error::JsonParse {
         path: path.into(),
         message,
@@ -320,7 +333,7 @@ pub fn merge_json_fragment(
     let (Some(dst), Some(src)) = (cur.as_object_mut(), frag.as_object()) else {
         return Err(parse_err("top level must be a JSON object".to_string()));
     };
-    merge_objects(dst, src, "", &append_paths, path)?;
+    merge_objects(dst, src, "", &append_paths, path, force)?;
     Ok(pretty(&cur))
 }
 
@@ -330,6 +343,7 @@ fn merge_objects(
     prefix: &str,
     append_paths: &[String],
     path: &str,
+    force: bool,
 ) -> Result<(), Error> {
     for (key, src_value) in src {
         let full = if prefix.is_empty() {
@@ -344,6 +358,10 @@ fn merge_objects(
         if append_paths.contains(&full) {
             let (Some(dst_arr), Some(src_arr)) = (dst_value.as_array_mut(), src_value.as_array())
             else {
+                if force {
+                    *dst_value = src_value.clone();
+                    continue;
+                }
                 return Err(collision(&full, path));
             };
             for item in src_arr {
@@ -358,8 +376,13 @@ fn merge_objects(
                 &full,
                 append_paths,
                 path,
+                force,
             )?;
         } else if dst_value != src_value {
+            if force {
+                *dst_value = src_value.clone();
+                continue;
+            }
             return Err(collision(&full, path));
         }
     }

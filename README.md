@@ -26,7 +26,7 @@ and product design principles.
 
 ## Status
 
-Sprints 1–3 of the MVP are implemented (see `docs/product/sprints.md`).
+Sprints 1–4 of the MVP are implemented (see `docs/product/sprints.md`).
 Working today, end-to-end on the fixtures in `examples/.agent-profile/`:
 
 - **Profile schema v1** (`apiVersion: agent-profile/v1`): strict parsing
@@ -75,7 +75,35 @@ Working today, end-to-end on the fixtures in `examples/.agent-profile/`:
   untranslatable rules are surfaced, never silently dropped.
 - **Never-touch denylist**: `~/.claude.json`, `~/.claude/settings.json`, plugin
   registries, `auth.json`, caches/history — hardcoded below the adapters; no
-  flag bypasses it.
+  flag bypasses it, and the apply/teardown executor re-checks it per action
+  right before mutating (defense in depth).
+- **`apply --role <r> --target <t> --session-id <id> [--scope] [--force]`** —
+  the spawn-time product moment. `--session-id` is mandatory (the §3.5
+  orchestrator contract). Every mutation is atomic (write-then-rename), backed
+  up under `.agent-profile/backups/<session-id>/`, and recorded with sha256
+  `hashBefore`/`hashAfter` in `.agent-profile/state.json`. Pre-apply drift
+  (an owned file without our provenance header, or a merge-key collision)
+  refuses with exit 3; `--force` overrides, still backs up, and records the
+  override in state. A duplicate session id — or a second active session for
+  the same role+target — is a session error, exit 5. Resolved `${env:VAR}`
+  secrets are only ever written into a gitignored `.mcp.json`
+  (`git check-ignore` gate; refusal exit 2); unset references stay as
+  `${env:VAR}`, the pattern Claude itself supports. A failure mid-apply rolls
+  back the session's already-executed actions.
+- **`teardown (--session-id <id> | --all) [--force]`**: replays the session's
+  actions in reverse — owned files hash-verified then deleted (or restored
+  from backup after a forced apply), merges reversed key-level so foreign
+  edits made after apply survive, symlinks removed only if they still point at
+  our target, marked blocks removed by marker wherever they moved. Post-apply
+  drift refuses with the drifted paths (exit 3); `--force` falls back to
+  backup restore (owned) / best-effort key-level (merges). Backups are deleted
+  on clean teardown; apply→teardown restores a byte-identical tree.
+- **`current`**: active sessions from state.json (role, target, applied-at,
+  action count), human + `--json`.
+- **Full-cycle smoke test**: `scripts/smoke.sh` runs
+  validate→doctor→render→diff→apply→current→teardown for all three targets
+  inside a sandboxed HOME, asserting exit codes at every step (CI-ready,
+  runs in seconds).
 
 Try it (writes only into the sandbox directory you name):
 
@@ -107,9 +135,18 @@ codes are never reused):
 | F061 | error | Tool rule untranslatable to a Codex `prefix_rule(...)` |
 | F071 | info | `state.json` session older than 24h — consider teardown |
 
-Not yet implemented (exit 1 with a "not implemented" message): `apply`,
-`teardown`, `current`, `completions` — these land in sprints S4–S5 per the
-sprint plan.
+Try the full spawn-time cycle in a scratch repo (state and backups land in
+`.agent-profile/` of that repo; gitignore them as the one-time hint says):
+
+```bash
+agent-profile apply --role reviewer --target claude-teammate --session-id run1-reviewer --json
+agent-profile current
+agent-profile teardown --session-id run1-reviewer
+scripts/smoke.sh          # the whole cycle, all targets, sandboxed HOME
+```
+
+Not yet implemented (exit 1 with a "not implemented" message): `completions`
+— lands in sprint S5 per the sprint plan.
 
 Exit codes follow the design contract: 0 success, 1 internal error,
 2 validation failure, 3 drift, 4 doctor errors, 5 session/state error.

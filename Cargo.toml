@@ -22,6 +22,7 @@ serde = { version = "1", features = ["derive"] }
 # settings.local.json) in their original positions — surgical diffs.
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml = "0.9"
+sha2 = "0.10"
 similar = "3.1.1"
 tempfile = "3"
 thiserror = "2"

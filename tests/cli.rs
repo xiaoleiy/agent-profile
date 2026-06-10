@@ -66,9 +66,9 @@ fn help_lists_all_subcommands_from_design() {
 #[test]
 fn unimplemented_commands_exit_1() {
     let tmp = TempDir::new().unwrap();
-    // apply/teardown/current land in S4.
+    // completions lands in S5.
     cmd(tmp.path())
-        .args(["current"])
+        .args(["completions", "zsh"])
         .assert()
         .code(1)
         .stderr(predicate::str::contains("not implemented"));

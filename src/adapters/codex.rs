@@ -208,6 +208,17 @@ fn mcp_fragment(servers: &BTreeMap<String, McpServer>) -> String {
 /// different content is a collision → drift (design §3.2.2/§5.1); an
 /// identical key is a no-op.
 pub fn merge_toml_fragment(current: &str, fragment: &str, path: &str) -> Result<String, Error> {
+    merge_toml_fragment_with(current, fragment, path, false)
+}
+
+/// [`merge_toml_fragment`] with collision handling selectable: `force = true`
+/// makes our keys win on collision (apply `--force`, design §5.1).
+pub fn merge_toml_fragment_with(
+    current: &str,
+    fragment: &str,
+    path: &str,
+    force: bool,
+) -> Result<String, Error> {
     let parse_err = |message: String| Error::TomlParse {
         path: path.into(),
         message,
@@ -221,7 +232,14 @@ pub fn merge_toml_fragment(current: &str, fragment: &str, path: &str) -> Result<
     // New tables must land after every existing one — cloned fragment tables
     // carry fragment-local positions that would otherwise interleave.
     let mut next_pos: isize = max_table_position(doc.as_table()) + 1;
-    merge_tables(doc.as_table_mut(), frag.as_table(), "", path, &mut next_pos)?;
+    merge_tables(
+        doc.as_table_mut(),
+        frag.as_table(),
+        "",
+        path,
+        &mut next_pos,
+        force,
+    )?;
     Ok(doc.to_string())
 }
 
@@ -231,6 +249,7 @@ fn merge_tables(
     prefix: &str,
     path: &str,
     next_pos: &mut isize,
+    force: bool,
 ) -> Result<(), Error> {
     for (key, src_item) in src.iter() {
         let full = if prefix.is_empty() {
@@ -252,8 +271,15 @@ fn merge_tables(
                 &full,
                 path,
                 next_pos,
+                force,
             )?;
         } else if dst[key].to_string().trim() != src_item.to_string().trim() {
+            if force {
+                let mut item = src_item.clone();
+                reposition(&mut item, next_pos);
+                dst[key] = item;
+                continue;
+            }
             return Err(Error::Drift(format!(
                 "merge collision at `{full}` in {path}: key already exists with different \
                  content (not created by agent-profile)"

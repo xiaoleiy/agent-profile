@@ -59,6 +59,24 @@ pub enum Error {
     #[error("drift: {0}")]
     Drift(String),
 
+    #[error("drift detected:\n{}", .0.join("\n"))]
+    ApplyDrift(Vec<String>),
+
+    #[error("post-apply drift on: {}", .0.join(", "))]
+    TeardownDrift(Vec<String>),
+
+    #[error(
+        "refusing to write resolved secret{} ({}) into {path}: the file is not gitignored. \
+         Gitignore it, or keep the env reference pattern Claude itself supports by leaving \
+         the variable unset at apply time.",
+        if .vars.len() == 1 { "" } else { "s" },
+        .vars.iter().map(|v| format!("${{env:{v}}}")).collect::<Vec<_>>().join(", ")
+    )]
+    SecretNotIgnored { path: String, vars: Vec<String> },
+
+    #[error("session/state error: {0}")]
+    Session(String),
+
     #[error("failed to parse TOML at {path}: {message}")]
     TomlParse { path: PathBuf, message: String },
 
@@ -97,8 +115,10 @@ impl Error {
             | Error::UnknownRole { .. }
             | Error::UnknownTarget { .. }
             | Error::TargetNotAllowed { .. }
+            | Error::SecretNotIgnored { .. }
             | Error::Validation(_) => ExitCode::Validation,
-            Error::Drift(_) => ExitCode::Drift,
+            Error::Drift(_) | Error::ApplyDrift(_) | Error::TeardownDrift(_) => ExitCode::Drift,
+            Error::Session(_) => ExitCode::Session,
         }
     }
 }
@@ -154,6 +174,17 @@ mod tests {
             ExitCode::Validation
         );
         assert_eq!(Error::Drift("x".into()).exit_code(), ExitCode::Drift);
+        assert_eq!(Error::ApplyDrift(vec![]).exit_code(), ExitCode::Drift);
+        assert_eq!(Error::TeardownDrift(vec![]).exit_code(), ExitCode::Drift);
+        assert_eq!(Error::Session("x".into()).exit_code(), ExitCode::Session);
+        assert_eq!(
+            Error::SecretNotIgnored {
+                path: ".mcp.json".into(),
+                vars: vec!["X".into()]
+            }
+            .exit_code(),
+            ExitCode::Validation
+        );
         assert_eq!(
             Error::NeverTouch {
                 path: PathBuf::from("/x")

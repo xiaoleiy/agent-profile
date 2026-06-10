@@ -16,6 +16,7 @@ use crate::error::{Error, ExitCode};
 use crate::schema::types::Target;
 use crate::schema::validate::{self, UnitReport};
 use crate::schema::{ResolvedProfile, Workspace, merge};
+use crate::state::{self, Session};
 
 pub use crate::adapters::Scope;
 
@@ -166,10 +167,19 @@ fn dispatch(cli: &Cli) -> Result<ExitCode, Error> {
             role_target,
             assume_version,
         } => cmd_doctor(cli, role_target, *assume_version),
-        Command::Apply { .. }
-        | Command::Teardown { .. }
-        | Command::Current
-        | Command::Completions { .. } => Err(Error::NotImplemented),
+        Command::Apply {
+            role_target,
+            session_id,
+            scope,
+            force,
+        } => cmd_apply(cli, role_target, session_id, *scope, *force),
+        Command::Teardown {
+            session_id,
+            all,
+            force,
+        } => cmd_teardown(cli, session_id.as_deref(), *all, *force),
+        Command::Current => cmd_current(cli),
+        Command::Completions { .. } => Err(Error::NotImplemented),
     }
 }
 
@@ -378,12 +388,14 @@ fn plural(n: usize) -> &'static str {
 
 // ---------------------------------------------------------------- render / diff
 
-/// Shared front half of render/diff: resolve, check target, plan, denylist.
+/// Shared front half of render/diff/apply: resolve, check target, plan,
+/// denylist.
 fn build_plan(
     cli: &Cli,
     rt: &RoleTargetArgs,
     scope: Scope,
-) -> Result<(ResolvedProfile, Target, PlanContext, Plan), Error> {
+    session_id: Option<&str>,
+) -> Result<(Workspace, ResolvedProfile, Target, PlanContext, Plan), Error> {
     let ws = workspace(cli)?;
     let target = Target::parse(&rt.target).ok_or_else(|| Error::UnknownTarget {
         target: rt.target.clone(),
@@ -405,13 +417,13 @@ fn build_plan(
         repo_root,
         workspace_root: ws.root().to_path_buf(),
         home,
-        session_id: None,
+        session_id: session_id.map(String::from),
     };
     let adapter = adapters::adapter_for(target).ok_or(Error::NotImplemented)?;
     let plan = adapter.plan(&resolved, &ctx)?;
     // Hardcoded never-touch denylist — enforced regardless of flags.
     adapters::denylist::assert_plan_allowed(&plan, &ctx)?;
-    Ok((resolved, target, ctx, plan))
+    Ok((ws, resolved, target, ctx, plan))
 }
 
 fn cmd_render(
@@ -420,7 +432,7 @@ fn cmd_render(
     out: Option<&std::path::Path>,
     scope: Scope,
 ) -> Result<ExitCode, Error> {
-    let (_resolved, target, _ctx, plan) = build_plan(cli, rt, scope)?;
+    let (_ws, _resolved, target, _ctx, plan) = build_plan(cli, rt, scope, None)?;
 
     let written = match out {
         Some(dir) => Some((dir, adapters::materialize(&plan, dir)?.len())),
@@ -515,7 +527,7 @@ fn print_skipped(s: &Skipped) {
 }
 
 fn cmd_diff(cli: &Cli, rt: &RoleTargetArgs, scope: Scope) -> Result<ExitCode, Error> {
-    let (_resolved, target, ctx, plan) = build_plan(cli, rt, scope)?;
+    let (_ws, _resolved, target, ctx, plan) = build_plan(cli, rt, scope, None)?;
 
     let mut diffs: Vec<(String, String)> = Vec::new();
     for action in &plan.actions {
@@ -651,4 +663,359 @@ fn cmd_doctor(
     } else {
         ExitCode::Success
     })
+}
+
+// ---------------------------------------------------------------- apply
+
+fn cmd_apply(
+    cli: &Cli,
+    rt: &RoleTargetArgs,
+    session_id: &str,
+    scope: Scope,
+    force: bool,
+) -> Result<ExitCode, Error> {
+    let (ws, _resolved, target, ctx, plan) = build_plan(cli, rt, scope, Some(session_id))?;
+    let mut ledger = state::load(ws.root())?;
+
+    // Session/state gates (exit 5, design §2).
+    if ledger.sessions.contains_key(session_id) {
+        return Err(Error::Session(format!(
+            "session `{session_id}` is already active — tear it down first \
+             (`agent-profile teardown --session-id {session_id}`) or pick a new id"
+        )));
+    }
+    if let Some((id, _)) = ledger
+        .sessions
+        .iter()
+        .find(|(_, s)| s.role == rt.role && s.target == target.as_str())
+    {
+        return Err(Error::Session(format!(
+            "active session `{id}` already applies role `{}` to target `{}` — tear it down first",
+            rt.role,
+            target.as_str()
+        )));
+    }
+
+    let outcome = match state::execute_apply(&plan, &ctx, session_id, force) {
+        Ok(outcome) => outcome,
+        // §4.5 drift refusal: message + suggested commands, exit 3.
+        Err(Error::ApplyDrift(msgs)) => {
+            if cli.json {
+                let envelope = serde_json::json!({
+                    "schemaVersion": JSON_SCHEMA_VERSION,
+                    "sessionId": session_id,
+                    "status": "drift",
+                    "drift": msgs,
+                });
+                println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
+            } else {
+                for msg in &msgs {
+                    println!("✗ drift: {msg}");
+                }
+                println!(
+                    "  → inspect: agent-profile diff --role {} --target {}",
+                    rt.role, rt.target
+                );
+                println!("  → override (backs up the file first): apply --force");
+            }
+            return Ok(ExitCode::Drift);
+        }
+        Err(e) => return Err(e),
+    };
+
+    let scope_str = match scope {
+        Scope::Repo => "repo",
+        Scope::User => "user",
+    };
+    let session = Session {
+        role: rt.role.clone(),
+        target: target.as_str().to_string(),
+        scope: scope_str.to_string(),
+        applied_at: state::now_rfc3339(),
+        agent_profile_version: env!("CARGO_PKG_VERSION").to_string(),
+        actions: outcome.records.clone(),
+    };
+    ledger.sessions.insert(session_id.to_string(), session);
+
+    // One-time hint: state.json/backups belong in .gitignore (design §3.4).
+    let show_hint = !ledger.gitignore_hint_shown
+        && !state::is_git_ignored(&ctx.repo_root, &state::state_path(ws.root()));
+    if show_hint {
+        ledger.gitignore_hint_shown = true;
+    }
+    state::save(ws.root(), &ledger)?;
+    if show_hint && !cli.quiet {
+        eprintln!(
+            "hint: add `.agent-profile/state.json` and `.agent-profile/backups/` to your \
+             .gitignore — they are local session state"
+        );
+    }
+
+    let backup_dir = state::backup_dir(ws.root(), session_id);
+    let backup_display = backup_dir
+        .strip_prefix(&ctx.repo_root)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| backup_dir.display().to_string());
+
+    if cli.json {
+        // §2 contract: render envelope plus sessionId/backupDir/per-action status.
+        let actions: Vec<serde_json::Value> = plan
+            .actions
+            .iter()
+            .map(|a| {
+                let mut v = serde_json::to_value(a).unwrap();
+                let status = if outcome.unchanged_paths.contains(&a.path().to_string()) {
+                    "unchanged"
+                } else {
+                    "applied"
+                };
+                v["status"] = serde_json::json!(status);
+                v
+            })
+            .collect();
+        let mut envelope = serde_json::json!({
+            "schemaVersion": JSON_SCHEMA_VERSION,
+            "sessionId": session_id,
+            "role": rt.role,
+            "target": target.as_str(),
+            "status": "applied",
+            "backupDir": backup_display,
+            "actions": actions,
+            "skipped": plan.skipped,
+        });
+        if !plan.notes.is_empty() {
+            envelope["notes"] = serde_json::json!(plan.notes);
+        }
+        println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
+    } else {
+        println!(
+            "APPLY session {session_id} ({} → {})",
+            rt.role,
+            target.as_str()
+        );
+        let width = plan
+            .actions
+            .iter()
+            .map(|a| a.path().len())
+            .max()
+            .unwrap_or(0)
+            .max(20);
+        for action in &plan.actions {
+            let extra = match action {
+                Action::MergeKeys { keys, .. } => format!(
+                    "  + {}",
+                    keys.iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                Action::Symlink { link_target, .. } => format!("  -> {link_target}"),
+                Action::AppendBlock { marker, .. } => format!("  marked block {marker}"),
+                Action::Create { .. } => String::new(),
+            };
+            let status = if outcome.unchanged_paths.contains(&action.path().to_string()) {
+                " (unchanged)"
+            } else {
+                ""
+            };
+            println!(
+                "  {:<11} {:<width$}{extra}{status}",
+                action.op(),
+                action.path()
+            );
+        }
+        for s in &plan.skipped {
+            print_skipped(s);
+        }
+        for note in &plan.notes {
+            println!("  note: {note}");
+        }
+        println!(
+            "✓ session {session_id} applied ({} action{}; backups in {backup_display})",
+            outcome.records.len(),
+            plural(outcome.records.len()),
+        );
+    }
+    Ok(ExitCode::Success)
+}
+
+// ---------------------------------------------------------------- teardown
+
+fn cmd_teardown(
+    cli: &Cli,
+    session_id: Option<&str>,
+    all: bool,
+    force: bool,
+) -> Result<ExitCode, Error> {
+    let ws = workspace(cli)?;
+    let mut ledger = state::load(ws.root())?;
+
+    let ids: Vec<String> = if all {
+        ledger.sessions.keys().cloned().collect()
+    } else {
+        let id = session_id.expect("clap enforces session-id xor all");
+        if !ledger.sessions.contains_key(id) {
+            return Err(Error::Session(format!(
+                "unknown session `{id}` — see `agent-profile current`"
+            )));
+        }
+        vec![id.to_string()]
+    };
+
+    if ids.is_empty() {
+        if cli.json {
+            let envelope = serde_json::json!({
+                "schemaVersion": JSON_SCHEMA_VERSION,
+                "sessions": [],
+            });
+            println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
+        } else {
+            println!("No active sessions — nothing to tear down.");
+        }
+        return Ok(ExitCode::Success);
+    }
+
+    let repo_root = ws.root().parent().unwrap_or(ws.root()).to_path_buf();
+    let home = std::env::home_dir().ok_or_else(|| Error::Io {
+        path: PathBuf::from("~"),
+        source: std::io::Error::other("cannot determine home directory"),
+    })?;
+    let ctx = PlanContext {
+        scope: Scope::Repo,
+        repo_root,
+        workspace_root: ws.root().to_path_buf(),
+        home,
+        session_id: None,
+    };
+
+    let mut json_sessions = Vec::new();
+    let mut drifted: Vec<(String, Vec<String>)> = Vec::new();
+    for id in &ids {
+        let session = ledger.sessions.get(id).expect("id from ledger").clone();
+        match state::execute_teardown(&session, id, &ctx, force) {
+            Ok(steps) => {
+                ledger.sessions.remove(id);
+                state::save(ws.root(), &ledger)?;
+                if cli.json {
+                    json_sessions.push(serde_json::json!({
+                        "sessionId": id,
+                        "status": "torn-down",
+                        "steps": steps,
+                    }));
+                } else {
+                    let width = steps
+                        .iter()
+                        .map(|s| s.path.len())
+                        .max()
+                        .unwrap_or(0)
+                        .max(20);
+                    for s in &steps {
+                        if s.detail.is_empty() {
+                            println!("  {:<8} {}", s.op, s.path);
+                        } else {
+                            println!("  {:<8} {:<width$}  ({})", s.op, s.path, s.detail);
+                        }
+                    }
+                    println!("✓ session {id} torn down, backups deleted");
+                }
+            }
+            Err(Error::TeardownDrift(paths)) => drifted.push((id.clone(), paths)),
+            Err(e) => return Err(e),
+        }
+    }
+
+    if !drifted.is_empty() {
+        if cli.json {
+            let envelope = serde_json::json!({
+                "schemaVersion": JSON_SCHEMA_VERSION,
+                "sessions": json_sessions,
+                "drift": drifted
+                    .iter()
+                    .map(|(id, paths)| serde_json::json!({ "sessionId": id, "paths": paths }))
+                    .collect::<Vec<_>>(),
+            });
+            println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
+        } else {
+            for (id, paths) in &drifted {
+                println!("✗ drift: session {id} files changed after apply:");
+                for p in paths {
+                    println!("    {p}");
+                }
+            }
+            println!(
+                "  → tear down anyway (backup restore for owned files, best-effort key-level \
+                 for merges): teardown --force"
+            );
+        }
+        return Ok(ExitCode::Drift);
+    }
+
+    if cli.json {
+        let envelope = serde_json::json!({
+            "schemaVersion": JSON_SCHEMA_VERSION,
+            "sessions": json_sessions,
+        });
+        println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
+    }
+    Ok(ExitCode::Success)
+}
+
+// ---------------------------------------------------------------- current
+
+fn cmd_current(cli: &Cli) -> Result<ExitCode, Error> {
+    let ws = workspace(cli)?;
+    let ledger = state::load(ws.root())?;
+
+    // §4.2 ordering: by applied time, then id.
+    let mut sessions: Vec<(&String, &Session)> = ledger.sessions.iter().collect();
+    sessions.sort_by(|a, b| (&a.1.applied_at, a.0).cmp(&(&b.1.applied_at, b.0)));
+
+    if cli.json {
+        let envelope = serde_json::json!({
+            "schemaVersion": JSON_SCHEMA_VERSION,
+            "sessions": sessions
+                .iter()
+                .map(|(id, s)| serde_json::json!({
+                    "sessionId": id,
+                    "role": s.role,
+                    "target": s.target,
+                    "scope": s.scope,
+                    "appliedAt": s.applied_at,
+                    "actions": s.actions.len(),
+                }))
+                .collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
+        return Ok(ExitCode::Success);
+    }
+
+    println!("ACTIVE SESSIONS");
+    if sessions.is_empty() {
+        println!("  (none)");
+        return Ok(ExitCode::Success);
+    }
+    let id_w = sessions.iter().map(|(id, _)| id.len()).max().unwrap_or(0);
+    let role_w = sessions
+        .iter()
+        .map(|(_, s)| s.role.len())
+        .max()
+        .unwrap_or(0);
+    let target_w = sessions
+        .iter()
+        .map(|(_, s)| s.target.len())
+        .max()
+        .unwrap_or(0);
+    for (id, s) in &sessions {
+        // appliedAt is YYYY-MM-DDTHH:MM:SSZ — show the HH:MM:SS as in §4.2.
+        let time = s.applied_at.get(11..19).unwrap_or(&s.applied_at);
+        println!(
+            "  {:<id_w$}   {:<role_w$} → {:<target_w$}   applied {time}  ({} action{})",
+            id,
+            s.role,
+            s.target,
+            s.actions.len(),
+            plural(s.actions.len()),
+        );
+    }
+    Ok(ExitCode::Success)
 }
