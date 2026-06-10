@@ -276,8 +276,8 @@ Ubuntu and macOS. Tag-triggered release builds
 tarballs + sha256 checksums) and GitHub Pages deploys of `site/`
 (`.github/workflows/pages.yml`) are wired but no release tag has been cut yet.
 
-Not yet done (sprint S6): first tagged release, Homebrew/crates.io
-distribution, probe scorecard (`docs/probe.md`).
+The 90-day probe scorecard lives at [`docs/probe.md`](docs/probe.md).
+Not yet done (sprint S6): crates.io distribution.
 
 ## Docs
 
