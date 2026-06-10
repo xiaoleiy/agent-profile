@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Docs — orchestrator integration recipes
+    url: https://github.com/xiaoleiy/agent-profile/blob/main/docs/integrations.md
+    about: CAO / crew-code / agent-loop hook recipes, trap-based teardown, worktree pattern.
+  - name: Docs — frozen --json API contracts
+    url: https://github.com/xiaoleiy/agent-profile/blob/main/docs/json-api.md
+    about: Every --json envelope, schemaVersion 1, with real captured examples.

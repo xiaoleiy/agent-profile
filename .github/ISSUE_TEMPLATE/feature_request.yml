@@ -1,0 +1,61 @@
+name: Feature request / use case
+description: Something you need agent-profile to do — especially spawn-time provisioning use cases.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before writing: the non-goals in the README (registry, scenario
+        switching, policy/audit, orchestration, Cursor, hosted anything) are
+        deliberate. Requests inside them will be closed with a pointer to
+        the tool that already covers the need.
+  - type: textarea
+    id: use-case
+    attributes:
+      label: The use case, in your own words
+      description: What are you trying to provision, for which workers, at what moment? Concrete loop descriptions are worth far more than abstract features.
+    validations:
+      required: true
+  - type: dropdown
+    id: orchestrator
+    attributes:
+      label: Which orchestrator would call this?
+      description: Feeds the project's success metrics — please answer even if "none".
+      options:
+        - none / manual CLI use
+        - agent-loop
+        - CAO (awslabs/cli-agent-orchestrator)
+        - crew-code
+        - hand-rolled scripts
+        - other (name it in the description)
+    validations:
+      required: true
+  - type: dropdown
+    id: runtime
+    attributes:
+      label: Which runtime(s) does this involve?
+      multiple: true
+      options:
+        - Claude Code (subagents)
+        - Claude Code (teammates / Agent Teams)
+        - Codex CLI
+        - a runtime agent-profile doesn't target yet (name it below)
+    validations:
+      required: true
+  - type: input
+    id: provider-cli-versions
+    attributes:
+      label: Provider CLI version(s) you run
+      placeholder: "claude 2.0.34, codex-cli 0.21.0"
+    validations:
+      required: true
+  - type: input
+    id: agent-profile-version
+    attributes:
+      label: agent-profile version
+      placeholder: agent-profile 0.1.0 (abc123def)
+  - type: textarea
+    id: workaround
+    attributes:
+      label: What you do today instead
+      description: The script/hack this would replace, if any.

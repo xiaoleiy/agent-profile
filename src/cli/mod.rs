@@ -20,10 +20,19 @@ use crate::state::{self, Session};
 
 pub use crate::adapters::Scope;
 
+/// Build metadata shown by `--version` (S5-T2): crate version + git sha.
+/// Format is stable: `X.Y.Z (<sha>)`, with `unknown` outside a git build.
+pub const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("AGENT_PROFILE_GIT_SHA"),
+    ")"
+);
+
 #[derive(Debug, Parser)]
 #[command(
     name = "agent-profile",
-    version,
+    version = VERSION,
     about = "Spawn-time role-profile resolver for coding-agent runtimes"
 )]
 pub struct Cli {
@@ -129,7 +138,8 @@ pub enum Command {
     /// Generate shell completions.
     Completions {
         /// Shell to generate completions for.
-        shell: String,
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
     },
 }
 
@@ -179,8 +189,15 @@ fn dispatch(cli: &Cli) -> Result<ExitCode, Error> {
             force,
         } => cmd_teardown(cli, session_id.as_deref(), *all, *force),
         Command::Current => cmd_current(cli),
-        Command::Completions { .. } => Err(Error::NotImplemented),
+        Command::Completions { shell } => cmd_completions(*shell),
     }
+}
+
+fn cmd_completions(shell: clap_complete::Shell) -> Result<ExitCode, Error> {
+    use clap::CommandFactory;
+    let mut command = Cli::command();
+    clap_complete::generate(shell, &mut command, "agent-profile", &mut std::io::stdout());
+    Ok(ExitCode::Success)
 }
 
 fn workspace(cli: &Cli) -> Result<Workspace, Error> {
@@ -489,11 +506,18 @@ fn print_plan_human(plan: &Plan, written: Option<(&std::path::Path, usize)>) {
                     .collect::<Vec<_>>()
                     .join("  ");
                 println!("  {:<10}  {path:<width$}  {added}", "merge-keys");
-                println!(
-                    "{:14}(key-level merge via toml_edit; comments/format preserved;",
-                    ""
-                );
-                println!("{:14} existing tables untouched)", "");
+                if path.ends_with(".toml") {
+                    println!(
+                        "{:14}(key-level merge via toml_edit; comments/format preserved;",
+                        ""
+                    );
+                    println!("{:14} existing tables untouched)", "");
+                } else {
+                    println!(
+                        "{:14}(key-level JSON merge; keys we don't own preserved key-for-key)",
+                        ""
+                    );
+                }
             }
             Action::AppendBlock { path, content, .. } => println!(
                 "  {:<10}  {path:<width$}  marked block ({} lines, @include stub)",
@@ -818,8 +842,9 @@ fn cmd_apply(
             } else {
                 ""
             };
+            // Width 12 fits the longest op name, `append-block`.
             println!(
-                "  {:<11} {:<width$}{extra}{status}",
+                "  {:<12} {:<width$}{extra}{status}",
                 action.op(),
                 action.path()
             );

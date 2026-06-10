@@ -64,14 +64,63 @@ fn help_lists_all_subcommands_from_design() {
 }
 
 #[test]
-fn unimplemented_commands_exit_1() {
+fn completions_generate_for_each_shell() {
     let tmp = TempDir::new().unwrap();
-    // completions lands in S5.
-    cmd(tmp.path())
+    // zsh completions must be loadable: compdef header + the function name.
+    let assert = cmd(tmp.path())
         .args(["completions", "zsh"])
         .assert()
-        .code(1)
-        .stderr(predicate::str::contains("not implemented"));
+        .code(0);
+    let zsh = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(zsh.starts_with("#compdef agent-profile"));
+    assert!(zsh.contains("_agent-profile"));
+    // Subcommands must be present so completion actually helps.
+    for sub in ["render", "apply", "teardown", "doctor"] {
+        assert!(zsh.contains(sub), "zsh completions missing `{sub}`");
+    }
+
+    cmd(tmp.path())
+        .args(["completions", "bash"])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("complete -F _agent-profile"));
+    cmd(tmp.path())
+        .args(["completions", "fish"])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("complete -c agent-profile"));
+
+    // Unknown shell is a clap usage error, not a panic.
+    cmd(tmp.path())
+        .args(["completions", "tcsh"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("invalid value"));
+}
+
+#[test]
+fn version_output_has_stable_format() {
+    let tmp = TempDir::new().unwrap();
+    let assert = cmd(tmp.path()).arg("--version").assert().code(0);
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    // `agent-profile X.Y.Z (<git sha>|unknown)` — S5-T2 stable format.
+    let rest = stdout
+        .strip_prefix("agent-profile ")
+        .expect("version output starts with binary name");
+    let (semver, meta) = rest.trim_end().split_once(' ').expect("version + meta");
+    assert_eq!(semver.split('.').count(), 3, "semver triple: {semver}");
+    assert!(
+        semver.split('.').all(|p| p.parse::<u64>().is_ok()),
+        "numeric semver: {semver}"
+    );
+    let sha = meta
+        .strip_prefix('(')
+        .and_then(|m| m.strip_suffix(')'))
+        .expect("parenthesized build metadata");
+    assert!(
+        sha == "unknown" || sha.chars().all(|c| c.is_ascii_hexdigit()),
+        "git sha or `unknown`: {sha}"
+    );
 }
 
 #[test]

@@ -1,0 +1,78 @@
+{
+  "schemaVersion": 1,
+  "role": "reviewer",
+  "resolved": {
+    "apiVersion": "agent-profile/v1",
+    "name": "reviewer",
+    "description": "Read-only code reviewer for implement-review loops.",
+    "role": "reviewer",
+    "targets": [
+      "claude-subagent",
+      "claude-teammate",
+      "codex-agent"
+    ],
+    "include": [
+      "mcp-github-readonly",
+      "perms-readonly"
+    ],
+    "model": {
+      "claude": "claude-fable-5",
+      "codex": "gpt-5.3-codex",
+      "effort": "high"
+    },
+    "permissionMode": "readonly",
+    "tools": {
+      "allow": [
+        "Read",
+        "Grep",
+        "Bash(git diff:*)",
+        "Bash(git log:*)"
+      ],
+      "deny": [
+        "Write",
+        "Edit"
+      ]
+    },
+    "mcpServers": {
+      "docs-search": {
+        "type": "http",
+        "url": "https://mcp.example.com/docs"
+      },
+      "github-readonly": {
+        "command": "github-mcp",
+        "args": [
+          "--readonly"
+        ],
+        "env": {
+          "GITHUB_TOKEN": "${env:GITHUB_PAT_RO}"
+        }
+      }
+    },
+    "skills": [
+      "code-review",
+      "verification-before-completion"
+    ],
+    "context": [
+      "fragments/reviewer-instructions.md"
+    ],
+    "metadata": {
+      "owner": "xiaolei",
+      "tags": [
+        "review",
+        "readonly"
+      ]
+    }
+  },
+  "provenance": {
+    "context": "profiles/reviewer.yaml",
+    "mcpServers.docs-search": "profiles/reviewer.yaml",
+    "mcpServers.github-readonly": "profiles/reviewer.yaml",
+    "model.claude": "profiles/reviewer.yaml",
+    "model.codex": "profiles/reviewer.yaml",
+    "model.effort": "profiles/reviewer.yaml",
+    "permissionMode": "profiles/reviewer.yaml",
+    "skills": "profiles/reviewer.yaml",
+    "tools.allow": "profiles/reviewer.yaml",
+    "tools.deny": "profiles/reviewer.yaml"
+  }
+}

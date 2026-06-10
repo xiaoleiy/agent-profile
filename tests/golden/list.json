@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "profiles": [
+    {
+      "name": "implementer",
+      "role": "implementer",
+      "description": "Implementation worker with write access and TDD context.",
+      "targets": [
+        "claude-teammate",
+        "codex-agent"
+      ],
+      "include": [
+        "models-high-reasoning"
+      ]
+    },
+    {
+      "name": "qa",
+      "role": "qa",
+      "description": "Verification worker — runs tests and browser checks, no source edits.",
+      "targets": [
+        "claude-subagent",
+        "claude-teammate"
+      ]
+    },
+    {
+      "name": "reviewer",
+      "role": "reviewer",
+      "description": "Read-only code reviewer for implement-review loops.",
+      "targets": [
+        "claude-subagent",
+        "claude-teammate",
+        "codex-agent"
+      ],
+      "include": [
+        "mcp-github-readonly",
+        "perms-readonly"
+      ]
+    }
+  ],
+  "capabilities": [
+    {
+      "name": "mcp-github-readonly"
+    },
+    {
+      "name": "models-high-reasoning"
+    },
+    {
+      "name": "perms-readonly"
+    }
+  ]
+}

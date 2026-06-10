@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "role": "reviewer",
+  "target": "claude-teammate",
+  "cliVersion": "2.0.34",
+  "findings": [
+    {
+      "level": "error",
+      "code": "F012",
+      "message": "field `model.effort` not honored by claude 2.0.34 teammate spawn — no per-teammate effort control",
+      "field": "model.effort"
+    },
+    {
+      "level": "error",
+      "code": "F012",
+      "message": "frontmatter field `permissionMode` not honored by claude 2.0.34 teammate spawn — rendered via settings.local.json defaultMode instead (info)",
+      "field": "permissionMode"
+    },
+    {
+      "level": "warn",
+      "code": "F031",
+      "message": "mcp server `github-readonly`: command `github-mcp` not found on PATH",
+      "field": "mcpServers.github-readonly.command"
+    },
+    {
+      "level": "warn",
+      "code": "F044",
+      "message": "env reference ${env:GITHUB_PAT_RO} is unset in current environment",
+      "field": "mcpServers.github-readonly.env.GITHUB_TOKEN"
+    }
+  ]
+}

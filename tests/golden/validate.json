@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "results": [
+    {
+      "name": "implementer",
+      "kind": "profile",
+      "findings": [],
+      "blocksResolved": 1
+    },
+    {
+      "name": "qa",
+      "kind": "profile",
+      "findings": [],
+      "blocksResolved": 0
+    },
+    {
+      "name": "reviewer",
+      "kind": "profile",
+      "findings": [],
+      "blocksResolved": 2
+    },
+    {
+      "name": "mcp-github-readonly",
+      "kind": "capability",
+      "findings": [],
+      "blocksResolved": 0
+    },
+    {
+      "name": "models-high-reasoning",
+      "kind": "capability",
+      "findings": [],
+      "blocksResolved": 0
+    },
+    {
+      "name": "perms-readonly",
+      "kind": "capability",
+      "findings": [],
+      "blocksResolved": 0
+    }
+  ]
+}

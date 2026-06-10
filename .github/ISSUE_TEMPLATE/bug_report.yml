@@ -1,0 +1,79 @@
+name: Bug report
+description: Something agent-profile did wrong — wrong render, refused apply, broken teardown, bad exit code.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. The orchestrator and CLI version questions
+        below are not bureaucracy — they directly steer what this probe
+        builds next.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, what you got. Include the exit code.
+      placeholder: |
+        $ agent-profile apply --role reviewer --target claude-teammate --session-id run1-reviewer
+        expected: …
+        got (exit N): …
+    validations:
+      required: true
+  - type: textarea
+    id: profile
+    attributes:
+      label: Profile / workspace (redact secrets)
+      description: The role profile YAML (and capability blocks) that reproduce it, or a minimal version.
+      render: yaml
+  - type: input
+    id: agent-profile-version
+    attributes:
+      label: agent-profile version
+      description: Output of `agent-profile --version`
+      placeholder: agent-profile 0.1.0 (abc123def)
+    validations:
+      required: true
+  - type: dropdown
+    id: orchestrator
+    attributes:
+      label: Which orchestrator (if any) calls agent-profile?
+      description: Feeds the project's success metrics — please answer even if "none".
+      options:
+        - none / manual CLI use
+        - agent-loop
+        - CAO (awslabs/cli-agent-orchestrator)
+        - crew-code
+        - hand-rolled scripts
+        - other (name it in the description)
+    validations:
+      required: true
+  - type: dropdown
+    id: target
+    attributes:
+      label: Render target involved
+      options:
+        - claude-subagent
+        - claude-teammate
+        - codex-agent
+        - more than one / not target-specific
+    validations:
+      required: true
+  - type: input
+    id: provider-cli-versions
+    attributes:
+      label: Provider CLI version(s)
+      description: "`claude --version` and/or `codex --version` on the affected machine."
+      placeholder: "claude 2.0.34, codex-cli 0.21.0"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: macOS 15.5 / Ubuntu 24.04
+  - type: textarea
+    id: doctor
+    attributes:
+      label: doctor output (if relevant)
+      description: "`agent-profile doctor --role <r> --target <t> --json` often explains render/apply surprises."
+      render: json

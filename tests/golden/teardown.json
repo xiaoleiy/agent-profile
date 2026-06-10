@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "sessions": [
+    {
+      "sessionId": "run7-reviewer",
+      "status": "torn-down",
+      "steps": [
+        {
+          "op": "remove",
+          "path": "CLAUDE.md",
+          "detail": "block session=run7-reviewer"
+        },
+        {
+          "op": "unlink",
+          "path": ".claude/skills/verification-before-completion"
+        },
+        {
+          "op": "unlink",
+          "path": ".claude/skills/code-review"
+        },
+        {
+          "op": "restore",
+          "path": ".claude/settings.local.json",
+          "detail": "removed 4 allow rules, 2 deny rules, defaultMode"
+        },
+        {
+          "op": "restore",
+          "path": ".mcp.json",
+          "detail": "removed keys mcpServers.docs-search, mcpServers.github-readonly"
+        },
+        {
+          "op": "delete",
+          "path": ".claude/agents/reviewer.md"
+        }
+      ]
+    }
+  ]
+}

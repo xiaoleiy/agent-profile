@@ -17,6 +17,7 @@ path = "src/lib.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 serde = { version = "1", features = ["derive"] }
 # preserve_order keeps foreign keys in merged JSON files (.mcp.json,
 # settings.local.json) in their original positions — surgical diffs.

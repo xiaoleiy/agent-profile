@@ -271,3 +271,29 @@ steps beyond the tag push; probe scorecard live and dated.
   stdout parseable) and tracked via a `gitignoreHintShown` extension flag in
   state.json (absent from the §3.4 example; skipped while false, so the
   example round-trips verbatim).
+
+- **S5-T6 "wire into one actual agent-loop (or CAO) run"**: no real
+  orchestrator is installed in the build environment, so the closest
+  faithful behavior was implemented and recorded instead: (a) a real,
+  captured render→apply→teardown cycle against a sandbox repo
+  (`docs/dogfood.md`, output verbatim, including a foreign edit surviving
+  teardown); (b) the trap-based worker wrapper from `docs/integrations.md`
+  executed end-to-end in the sandbox on both the worker-success and
+  worker-failure paths, plus the duplicate-session exit-5 collision; (c) the
+  per-worker worktree pattern verified with reviewer+qa applied to
+  `claude-teammate` simultaneously in two worktrees of one repo, both torn
+  down byte-clean. Rough edges found while dogfooding are recorded in
+  `docs/dogfood.md`; the two small ones (JSON merges mislabeled "via
+  toml_edit" in render human output; `append-block` column misalignment in
+  apply human output) were fixed in-sprint. A run against a real external
+  orchestrator remains open for S6/the probe period.
+
+- **S5-T2 "completions load cleanly in CI"**: CI does not exist until
+  S6-T1. Verified locally instead: `zsh -n` syntax check + `compinit` load
+  of the generated `_agent-profile`, plus structural assertions
+  (`#compdef`, function name, subcommands present) in `tests/cli.rs`.
+  Wiring the same check into CI belongs to S6-T1.
+
+- **S5-T1 golden normalization**: `appliedAt` (the only volatile field in
+  any v1 envelope) is pinned to a fixed timestamp before golden comparison;
+  everything else is compared byte-for-byte against real binary output.
