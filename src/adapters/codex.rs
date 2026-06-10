@@ -175,7 +175,7 @@ fn mcp_fragment(servers: &BTreeMap<String, McpServer>) -> String {
     doc.insert("mcp_servers", Item::Table(root));
     for (name, server) in servers {
         let mut t = Table::new();
-        match server.server_type {
+        match server.effective_type() {
             McpServerType::Stdio => {
                 if let Some(cmd) = &server.command {
                     t["command"] = value(cmd);
@@ -361,7 +361,7 @@ mod tests {
             mcp_servers: Some(BTreeMap::from([(
                 "github".to_string(),
                 McpServer {
-                    server_type: McpServerType::Stdio,
+                    server_type: None,
                     command: Some("github-mcp".into()),
                     args: None,
                     env: Some(BTreeMap::from([(
@@ -577,7 +577,7 @@ trust_level = "trusted"
         set.mcp_servers = Some(BTreeMap::from([(
             "docs-search".to_string(),
             McpServer {
-                server_type: McpServerType::Http,
+                server_type: Some(McpServerType::Http),
                 url: Some("https://mcp.example.com/docs".into()),
                 ..Default::default()
             },

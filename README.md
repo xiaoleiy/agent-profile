@@ -70,9 +70,9 @@ In any git repo (or try it on this repo's `examples/` first — see below):
 
 ```bash
 mkdir -p .agent-profile/profiles
-$EDITOR .agent-profile/profiles/reviewer.yaml   # see the schema below
+$EDITOR .agent-profile/profiles/reviewer.yaml   # paste the self-contained profile below
 agent-profile validate --role reviewer
-# ✓ reviewer: schema OK, 2 capability blocks resolved, no secret literals
+# ✓ reviewer: schema OK, 0 capability blocks resolved, no secret literals
 
 agent-profile render --role reviewer --target claude-subagent   # dry-run, always
 agent-profile doctor --role reviewer --target claude-teammate   # preflight vs the INSTALLED CLI
@@ -83,7 +83,11 @@ agent-profile teardown --session-id run1-reviewer
 
 A role profile is plain YAML — no new skills format (SKILL.md is the
 standard), no new MCP bundle format (server definitions keep their existing
-shape), secrets only by `${env:…}` reference (literals fail `validate`):
+shape), secrets only by `${env:…}` reference (literals fail `validate`). This
+quickstart profile is **self-contained** (no `include:` blocks or `context:`
+fragments to create first) so the commands above work as written; the
+`examples/` workspace shows the same profile factored into reusable capability
+blocks and context fragments:
 
 ```yaml
 # .agent-profile/profiles/reviewer.yaml
@@ -92,7 +96,6 @@ name: reviewer
 description: Read-only code reviewer for implement-review loops.
 role: reviewer
 targets: [claude-subagent, claude-teammate, codex-agent]
-include: [mcp-github-readonly, perms-readonly]   # reusable capability blocks
 
 model:
   claude: claude-fable-5
@@ -111,7 +114,6 @@ mcpServers:
     env: { GITHUB_TOKEN: "${env:GITHUB_PAT_RO}" }
 
 skills: [code-review]                # resolves ~/.agents/skills/<name>/SKILL.md
-context: [fragments/reviewer-instructions.md]
 ```
 
 Try everything against the checked-in examples without writing a profile:

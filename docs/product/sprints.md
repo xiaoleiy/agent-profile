@@ -297,3 +297,32 @@ steps beyond the tag push; probe scorecard live and dated.
 - **S5-T1 golden normalization**: `appliedAt` (the only volatile field in
   any v1 envelope) is pinned to a fixed timestamp before golden comparison;
   everything else is compared byte-for-byte against real binary output.
+
+- **Regression round 1 — `completions --json` exception**: design §2 and
+  `docs/json-api.md` state every command supports `--json` and prints exactly
+  one JSON envelope. `completions <shell>` is the one exception: it emits the
+  raw shell completion script (the bytes meant to be sourced) and ignores
+  `--json`, because wrapping a completion script in a JSON envelope would make
+  it unusable. The safer, more useful behavior is to keep emitting the raw
+  script; `docs/json-api.md` now documents the exception explicitly.
+
+- **Regression round 1 — path-traversal hardening**: `--role`, `include`
+  names, and `--session-id` are now validated as single safe path components
+  (no `/`, `\`, or `..`); `skills:` entries must be bare names and `context:`
+  fragments must stay inside the `.agent-profile/` tree (no `..`/absolute).
+  These names are used to build filesystem paths (capability/profile files,
+  backup dirs, skill symlinks), so an unvalidated `../` could read or write
+  outside the workspace/repo. The identity check (`name:` must equal the
+  filename stem, V003) is now enforced in `merge::resolve` as well as
+  `validate`, so `render`/`apply` — which build provider file paths from
+  `name` — can never act on an unvalidated `name`. `.yml` files are no longer
+  discovered by `list` (resolution is `.yaml`-only per §1.1), so discovery and
+  show/validate agree.
+
+- **Regression round 1 — resolved-secret hygiene in state.json**: the apply
+  ledger now records the *unresolved* merge fragment (with `${env:VAR}`
+  intact) in each merge-keys action's `content`, never the materialized
+  secret. The resolved value lives only in the on-disk target file (which
+  apply already gitignore-enforces, §5.5) and is no longer copyable out of
+  `state.json`. Post-apply drift detection still relies on `hashAfter` first;
+  the unresolved `content` is the fallback key-level check.

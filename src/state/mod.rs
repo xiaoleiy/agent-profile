@@ -482,7 +482,7 @@ fn execute_one(
             atomic_write(abs, content)?;
             record.hash_after = Some(sha256_of(content));
         }
-        Action::MergeKeys { keys, .. } => {
+        Action::MergeKeys { keys, content, .. } => {
             let effective = prep.effective.as_deref().expect("set in precheck");
             let cur = current.as_deref().unwrap_or("");
             let merged = if is_toml(action.path()) {
@@ -502,7 +502,11 @@ fn execute_one(
             atomic_write(abs, &merged)?;
             record.keys = Some(keys.clone());
             record.hash_after = Some(sha256_of(&merged));
-            record.content = Some(effective.to_string());
+            // §5.5 secret hygiene: persist the UNRESOLVED fragment (with the
+            // `${env:VAR}` reference intact), never the materialized secret —
+            // state.json is not guaranteed gitignored. The on-disk file (which
+            // does carry the resolved value) is gitignore-enforced in precheck.
+            record.content = Some(content.clone());
         }
         Action::Symlink { link_target, .. } => {
             // Only reached when the path is free or --force cleared it.

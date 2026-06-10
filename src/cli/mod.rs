@@ -698,6 +698,13 @@ fn cmd_apply(
     scope: Scope,
     force: bool,
 ) -> Result<ExitCode, Error> {
+    // A session id becomes a directory name under .agent-profile/backups/
+    // (design §3.1/§3.4); reject any id that could escape it (e.g. `../../`).
+    if !crate::schema::workspace::is_safe_component(session_id) {
+        return Err(Error::InvalidSessionId {
+            id: session_id.to_string(),
+        });
+    }
     let (ws, _resolved, target, ctx, plan) = build_plan(cli, rt, scope, Some(session_id))?;
     let mut ledger = state::load(ws.root())?;
 

@@ -19,7 +19,7 @@
         "mcpServers.docs-search",
         "mcpServers.github-readonly"
       ],
-      "content": "{\n  \"mcpServers\": {\n    \"docs-search\": {\n      \"type\": \"http\",\n      \"url\": \"https://mcp.example.com/docs\"\n    },\n    \"github-readonly\": {\n      \"command\": \"github-mcp\",\n      \"args\": [\n        \"--readonly\"\n      ],\n      \"env\": {\n        \"GITHUB_TOKEN\": \"${env:GITHUB_PAT_RO}\"\n      }\n    }\n  }\n}\n",
+      "content": "{\n  \"mcpServers\": {\n    \"docs-search\": {\n      \"type\": \"http\",\n      \"url\": \"https://mcp.example.com/docs\"\n    },\n    \"github-readonly\": {\n      \"type\": \"stdio\",\n      \"command\": \"github-mcp\",\n      \"args\": [\n        \"--readonly\"\n      ],\n      \"env\": {\n        \"GITHUB_TOKEN\": \"${env:GITHUB_PAT_RO}\"\n      }\n    }\n  }\n}\n",
       "status": "applied"
     },
     {

@@ -39,6 +39,7 @@
         "url": "https://mcp.example.com/docs"
       },
       "github-readonly": {
+        "type": "stdio",
         "command": "github-mcp",
         "args": [
           "--readonly"

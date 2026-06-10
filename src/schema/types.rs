@@ -113,8 +113,12 @@ pub enum McpServerType {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpServer {
-    #[serde(rename = "type", default, skip_serializing_if = "is_default_type")]
-    pub server_type: McpServerType,
+    /// `Option` so the resolved view faithfully round-trips the source: a
+    /// `type:` omitted in the profile stays omitted (defaults to stdio), while
+    /// an explicitly written `type: stdio` is preserved rather than elided
+    /// (design §1.3).
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub server_type: Option<McpServerType>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -125,8 +129,12 @@ pub struct McpServer {
     pub url: Option<String>,
 }
 
-fn is_default_type(t: &McpServerType) -> bool {
-    *t == McpServerType::Stdio
+impl McpServer {
+    /// Effective transport type: an omitted `type:` defaults to stdio
+    /// (design §1.2).
+    pub fn effective_type(&self) -> McpServerType {
+        self.server_type.unwrap_or_default()
+    }
 }
 
 /// The subset of profile keys a capability block may carry, and the unit the

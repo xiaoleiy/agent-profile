@@ -91,6 +91,15 @@ impl Workspace {
     }
 
     pub fn load_profile(&self, name: &str) -> Result<SourceFile<Profile>, Error> {
+        // A role is the filename stem of a file inside profiles/ (design §1.1).
+        // `--role`/`include` names must be a single path component — never a
+        // relative (`../`) or absolute path that could escape the profiles dir.
+        if !is_safe_component(name) {
+            return Err(Error::UnknownRole {
+                role: name.to_string(),
+                path: self.profile_path(name),
+            });
+        }
         let path = self.profile_path(name);
         if !path.is_file() {
             return Err(Error::UnknownRole {
@@ -105,6 +114,20 @@ impl Workspace {
     }
 
     pub fn load_capability(&self, name: &str) -> Result<SourceFile<CapabilityBlock>, Error> {
+        // Capability blocks are flat, one level (design §1.1/§1.3): an include
+        // name is a block name, not a filesystem path. Reject any name that
+        // could traverse out of capabilities/ (e.g. `../../../outside/evil`).
+        if !is_safe_component(name) {
+            return Err(Error::Validation(vec![Finding::new(
+                Code::MissingCapability,
+                format!(
+                    "include `{name}` is not a valid capability block name — capability blocks \
+                     are flat (one level); names cannot contain path separators or `..`"
+                ),
+                Some("include".to_string()),
+                Some("include".to_string()),
+            )]));
+        }
         let path = self.capability_path(name);
         if !path.is_file() {
             return Err(Error::Validation(vec![Finding::new(
@@ -122,6 +145,18 @@ impl Workspace {
         check_api_version(&src.value.api_version, &src.rel)?;
         Ok(src)
     }
+}
+
+/// Is `name` a single, safe path component? Used to gate `--role` and
+/// `include` names so they can never escape the profiles/capabilities dirs
+/// via `..` or absolute/relative path syntax (design §1.1/§1.3).
+pub fn is_safe_component(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
 }
 
 fn check_api_version(found: &str, rel: &str) -> Result<(), Error> {
@@ -173,9 +208,10 @@ fn list_yaml_stems(dir: &Path) -> Result<Vec<String>, Error> {
             source,
         })?;
         let path = entry.path();
-        let is_yaml = path
-            .extension()
-            .is_some_and(|ext| ext == "yaml" || ext == "yml");
+        // Discovery must agree with resolution: profiles/capabilities are
+        // `<name>.yaml` only (design §1.1). A `.yml` file is not a profile, so
+        // it must not appear in `list` and then fail to load in show/validate.
+        let is_yaml = path.extension().is_some_and(|ext| ext == "yaml");
         if path.is_file()
             && is_yaml
             && let Some(stem) = path.file_stem().and_then(|s| s.to_str())

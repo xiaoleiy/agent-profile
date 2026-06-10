@@ -318,7 +318,7 @@ fn check_mcp_servers(resolved: &ResolvedProfile, findings: &mut Vec<Finding>) {
         return;
     };
     for (name, server) in servers {
-        match server.server_type {
+        match server.effective_type() {
             McpServerType::Stdio => {
                 if let Some(command) = &server.command
                     && which::which(command).is_err()

@@ -76,6 +76,12 @@ pub fn parse(rule: &str) -> Result<ToolRule, String> {
     })
 }
 
+/// Shell metacharacters that turn a `Bash(...)` specifier into a compound
+/// command (no single-command prefix → untranslatable to a Codex prefix_rule).
+fn is_shell_metachar(c: char) -> bool {
+    matches!(c, '|' | '&' | ';' | '<' | '>' | '`' | '$' | '(' | ')')
+}
+
 /// Result of translating one canonical rule for the Codex target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodexRule {
@@ -92,6 +98,19 @@ pub fn to_codex(rule: &str, decision: &str) -> CodexRule {
     };
     match parse(rule) {
         Ok(ToolRule::Bash { words, .. }) => {
+            // A Codex prefix_rule matches a single command's argv prefix. A
+            // compound/piped specifier (pipes, redirects, `&&`/`;`/subshells,
+            // command/variable substitution) has no single-command prefix —
+            // tokenizing the operator into the pattern array yields a rule
+            // Codex could never match, so flag it untranslatable (design
+            // §3.3/§5.3.6) instead of emitting garbage.
+            if words.iter().any(|w| w.chars().any(is_shell_metachar)) {
+                return untranslatable(
+                    "compound/piped shell specifiers (pipes, redirects, &&/;/subshells, \
+                     substitutions) have no single-command Codex prefix_rule equivalent"
+                        .to_string(),
+                );
+            }
             let pattern = words
                 .iter()
                 .map(|w| format!("\"{}\"", w.replace('\\', "\\\\").replace('"', "\\\"")))
@@ -229,5 +248,36 @@ mod tests {
             }
             other => panic!("expected untranslatable, got {other:?}"),
         }
+    }
+
+    /// Regression (AREA2-03): a piped/compound Bash specifier must be flagged
+    /// untranslatable, never emitted as a `prefix_rule` with the shell
+    /// operator naively tokenized into the pattern array.
+    #[test]
+    fn piped_or_compound_bash_specifier_is_untranslatable() {
+        for rule in [
+            "Bash(git diff | grep foo:*)",
+            "Bash(ls && rm -rf x:*)",
+            "Bash(echo $(whoami):*)",
+            "Bash(cat a > b:*)",
+            "Bash(a; b:*)",
+        ] {
+            match to_codex(rule, "allow") {
+                CodexRule::Untranslatable { reason, .. } => {
+                    assert!(
+                        reason.contains("compound") || reason.contains("prefix"),
+                        "{reason}"
+                    );
+                }
+                CodexRule::PrefixRule(s) => {
+                    panic!("`{rule}` must not translate to a prefix_rule, got {s}");
+                }
+            }
+        }
+        // A plain prefix rule still translates.
+        assert!(matches!(
+            to_codex("Bash(git diff:*)", "allow"),
+            CodexRule::PrefixRule(_)
+        ));
     }
 }

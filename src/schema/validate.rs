@@ -27,6 +27,8 @@ pub enum Code {
     CapabilityInvalid,
     /// V008 — MCP server shape invalid (stdio without command / http without url).
     McpServerShape,
+    /// V009 — unsafe `skills:`/`context:` reference (path traversal / absolute).
+    UnsafeReference,
     /// V010 — value starts with a known credential prefix.
     SecretTokenPrefix,
     /// V011 — high-entropy literal that looks like a credential.
@@ -46,6 +48,7 @@ impl Code {
             Code::NestedInclude => "V006",
             Code::CapabilityInvalid => "V007",
             Code::McpServerShape => "V008",
+            Code::UnsafeReference => "V009",
             Code::SecretTokenPrefix => "V010",
             Code::SecretHighEntropy => "V011",
             Code::SecretNamedKey => "V012",
@@ -172,6 +175,13 @@ pub fn validate_role(ws: &Workspace, role: &str) -> Result<UnitReport, Error> {
             .extend(secrets::scan_mcp_servers(servers, &src.raw, &src.rel));
     }
 
+    check_references(
+        profile.skills.as_ref(),
+        profile.context.as_ref(),
+        &src.rel,
+        &mut report.findings,
+    );
+
     for include in &profile.include {
         match validate_capability(ws, include) {
             Ok(block_report) => {
@@ -247,6 +257,13 @@ pub fn validate_capability(ws: &Workspace, name: &str) -> Result<UnitReport, Err
             .extend(secrets::scan_mcp_servers(servers, &src.raw, &src.rel));
     }
 
+    check_references(
+        block.skills.as_ref(),
+        block.context.as_ref(),
+        &src.rel,
+        &mut report.findings,
+    );
+
     Ok(report)
 }
 
@@ -262,13 +279,79 @@ pub fn validate_all(ws: &Workspace) -> Result<Vec<UnitReport>, Error> {
     Ok(reports)
 }
 
+/// A `skills:` entry must be a bare skill name (resolves to
+/// `~/.agents/skills/<name>/SKILL.md`, design §1.2) — never a path that could
+/// traverse out of the skills store (the claude-teammate adapter symlinks it).
+pub fn is_safe_skill_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+}
+
+/// A `context:` entry is a workspace-relative fragment path (design §1.2). It
+/// may contain `/`, but must stay inside the `.agent-profile/` tree: no
+/// absolute paths and no `..` components.
+pub fn is_safe_context_path(p: &str) -> bool {
+    use std::path::Component;
+    !p.is_empty()
+        && !p.contains('\0')
+        && !std::path::Path::new(p).components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+}
+
+/// Validate `skills:`/`context:` reference safety (path-traversal guard).
+pub fn check_references(
+    skills: Option<&Vec<String>>,
+    context: Option<&Vec<String>>,
+    rel: &str,
+    findings: &mut Vec<Finding>,
+) {
+    if let Some(skills) = skills {
+        for skill in skills {
+            if !is_safe_skill_name(skill) {
+                findings.push(Finding::new(
+                    Code::UnsafeReference,
+                    format!(
+                        "skill `{skill}` is not a valid skill name — skills resolve under \
+                         ~/.agents/skills/<name> and cannot contain path separators or `..`"
+                    ),
+                    Some(rel.to_string()),
+                    Some("skills".to_string()),
+                ));
+            }
+        }
+    }
+    if let Some(context) = context {
+        for fragment in context {
+            if !is_safe_context_path(fragment) {
+                findings.push(Finding::new(
+                    Code::UnsafeReference,
+                    format!(
+                        "context fragment `{fragment}` must be a path inside the .agent-profile \
+                         tree — no absolute paths or `..` traversal"
+                    ),
+                    Some(rel.to_string()),
+                    Some("context".to_string()),
+                ));
+            }
+        }
+    }
+}
+
 fn check_mcp_shapes(
     servers: &std::collections::BTreeMap<String, McpServer>,
     rel: &str,
     findings: &mut Vec<Finding>,
 ) {
     for (name, server) in servers {
-        match server.server_type {
+        match server.effective_type() {
             McpServerType::Stdio if server.command.is_none() => {
                 findings.push(Finding::new(
                     Code::McpServerShape,

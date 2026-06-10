@@ -325,68 +325,138 @@ pub fn merge_json_fragment_with(
     let frag: serde_json::Value =
         serde_json::from_str(fragment).map_err(|e| parse_err(format!("internal fragment: {e}")))?;
 
-    let append_paths: Vec<String> = keys
-        .iter()
-        .filter_map(|k| k.find("[+").map(|i| k[..i].to_string()))
-        .collect();
-
-    let (Some(dst), Some(src)) = (cur.as_object_mut(), frag.as_object()) else {
+    if !cur.is_object() {
         return Err(parse_err("top level must be a JSON object".to_string()));
-    };
-    merge_objects(dst, src, "", &append_paths, path, force)?;
+    }
+    if !frag.is_object() {
+        return Err(parse_err(
+            "internal fragment top level must be a JSON object".to_string(),
+        ));
+    }
+
+    // Drive the merge by the recorded keys: each is the *unit of ownership*.
+    // A non-append key we add must not already exist with different content —
+    // a same-name collision is drift (design §3.2.2/§5.1), even when our value
+    // and the existing one differ only by which sub-keys each carries (we do
+    // NOT deep-merge into a server/entry someone else created). Append keys
+    // (`…[+N]`) get array-append semantics, tracked individually (§3.2.3).
+    for key in keys {
+        if let Some(i) = key.find("[+") {
+            json_append_array(&mut cur, &frag, &key[..i], path, force)?;
+        } else {
+            json_set_key(&mut cur, &frag, key, path, force)?;
+        }
+    }
     Ok(pretty(&cur))
 }
 
-fn merge_objects(
-    dst: &mut serde_json::Map<String, serde_json::Value>,
-    src: &serde_json::Map<String, serde_json::Value>,
-    prefix: &str,
-    append_paths: &[String],
+/// Set `dotted` in `cur` to the value the fragment carries there, creating any
+/// missing parent objects. Existing identical value → no-op; existing
+/// different value → collision (drift) unless `force`.
+fn json_set_key(
+    cur: &mut serde_json::Value,
+    frag: &serde_json::Value,
+    dotted: &str,
     path: &str,
     force: bool,
 ) -> Result<(), Error> {
-    for (key, src_value) in src {
-        let full = if prefix.is_empty() {
-            key.clone()
-        } else {
-            format!("{prefix}.{key}")
-        };
-        let Some(dst_value) = dst.get_mut(key) else {
-            dst.insert(key.clone(), src_value.clone());
-            continue;
-        };
-        if append_paths.contains(&full) {
-            let (Some(dst_arr), Some(src_arr)) = (dst_value.as_array_mut(), src_value.as_array())
-            else {
-                if force {
-                    *dst_value = src_value.clone();
-                    continue;
-                }
-                return Err(collision(&full, path));
-            };
-            for item in src_arr {
-                if !dst_arr.contains(item) {
-                    dst_arr.push(item.clone());
-                }
-            }
-        } else if dst_value.is_object() && src_value.is_object() {
-            merge_objects(
-                dst_value.as_object_mut().expect("checked is_object"),
-                src_value.as_object().expect("checked is_object"),
-                &full,
-                append_paths,
-                path,
-                force,
-            )?;
-        } else if dst_value != src_value {
+    let Some(src_value) = json_get(frag, dotted) else {
+        return Ok(());
+    };
+    let (obj, leaf) = ensure_parent_object(cur, dotted, path)?;
+    match obj.get(&leaf) {
+        None => {
+            obj.insert(leaf, src_value.clone());
+        }
+        Some(existing) if existing == src_value => {}
+        Some(existing) => {
             if force {
-                *dst_value = src_value.clone();
-                continue;
+                obj.insert(leaf, src_value.clone());
+            } else {
+                return Err(collision(
+                    &first_diff_leaf(existing, src_value, dotted),
+                    path,
+                ));
             }
-            return Err(collision(&full, path));
         }
     }
     Ok(())
+}
+
+/// Append the fragment's array entries at `base` into `cur`, skipping entries
+/// already present. Creates the array (and parents) when missing.
+fn json_append_array(
+    cur: &mut serde_json::Value,
+    frag: &serde_json::Value,
+    base: &str,
+    path: &str,
+    force: bool,
+) -> Result<(), Error> {
+    let Some(src_arr) = json_get(frag, base).and_then(|v| v.as_array()).cloned() else {
+        return Ok(());
+    };
+    let (obj, leaf) = ensure_parent_object(cur, base, path)?;
+    match obj.get_mut(&leaf) {
+        None => {
+            obj.insert(leaf, serde_json::Value::Array(src_arr));
+        }
+        Some(existing) => match existing.as_array_mut() {
+            Some(arr) => {
+                for item in src_arr {
+                    if !arr.contains(&item) {
+                        arr.push(item);
+                    }
+                }
+            }
+            None if force => *existing = serde_json::Value::Array(src_arr),
+            None => return Err(collision(base, path)),
+        },
+    }
+    Ok(())
+}
+
+/// Navigate to the object holding the last segment of `dotted`, creating empty
+/// objects for missing parents. Returns the parent map and the leaf key.
+fn ensure_parent_object<'a>(
+    root: &'a mut serde_json::Value,
+    dotted: &str,
+    path: &str,
+) -> Result<(&'a mut serde_json::Map<String, serde_json::Value>, String), Error> {
+    let segs: Vec<&str> = dotted.split('.').collect();
+    let (leaf, parents) = segs.split_last().expect("non-empty key");
+    let mut cur = root;
+    for seg in parents {
+        let obj = cur.as_object_mut().ok_or_else(|| collision(dotted, path))?;
+        cur = obj
+            .entry((*seg).to_string())
+            .or_insert_with(|| serde_json::json!({}));
+    }
+    let obj = cur.as_object_mut().ok_or_else(|| collision(dotted, path))?;
+    Ok((obj, (*leaf).to_string()))
+}
+
+fn json_get<'a>(v: &'a serde_json::Value, dotted: &str) -> Option<&'a serde_json::Value> {
+    let mut cur = v;
+    for seg in dotted.split('.') {
+        cur = cur.get(seg)?;
+    }
+    Some(cur)
+}
+
+/// Deepest dotted path at which `cur` and `new` first differ — used so a
+/// collision message points at the offending leaf (e.g.
+/// `mcpServers.github.command`) when one exists, falling back to the key.
+fn first_diff_leaf(cur: &serde_json::Value, new: &serde_json::Value, prefix: &str) -> String {
+    if let (Some(co), Some(no)) = (cur.as_object(), new.as_object()) {
+        for (k, nv) in no {
+            if let Some(cv) = co.get(k)
+                && cv != nv
+            {
+                return first_diff_leaf(cv, nv, &format!("{prefix}.{k}"));
+            }
+        }
+    }
+    prefix.to_string()
 }
 
 fn collision(full: &str, path: &str) -> Error {
@@ -447,7 +517,7 @@ mod tests {
                     (
                         "github-readonly".to_string(),
                         McpServer {
-                            server_type: McpServerType::Stdio,
+                            server_type: None,
                             command: Some("github-mcp".into()),
                             args: Some(vec!["--readonly".into()]),
                             env: Some(BTreeMap::from([(
@@ -460,7 +530,7 @@ mod tests {
                     (
                         "docs-search".to_string(),
                         McpServer {
-                            server_type: McpServerType::Http,
+                            server_type: Some(McpServerType::Http),
                             url: Some("https://mcp.example.com/docs".into()),
                             ..Default::default()
                         },
@@ -738,6 +808,34 @@ mod tests {
                 assert_eq!(&merged, content, "path {}", action.path());
             }
         }
+    }
+
+    /// Regression (AP4-01): a recorded server-name key that already exists is
+    /// a collision (drift) even when our value and the existing one differ
+    /// only by which sub-keys each carries — we never deep-merge into an entry
+    /// someone else created (design §3.2.2/§5.1).
+    #[test]
+    fn json_merge_same_name_partial_overlap_is_collision_not_deep_merge() {
+        let existing = r#"{ "mcpServers": { "github-readonly": { "type": "http", "url": "https://USER-OWNED.example" } } }"#;
+        let fragment = r#"{ "mcpServers": { "github-readonly": { "command": "github-mcp", "args": ["--readonly"] } } }"#;
+        let keys = vec!["mcpServers.github-readonly".to_string()];
+        let err = merge_json_fragment(existing, fragment, &keys, ".mcp.json").unwrap_err();
+        assert!(matches!(err, Error::Drift(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains("mcpServers.github-readonly"),
+            "{err}"
+        );
+        // Forced merge replaces our key wholesale (never partial deep-merge):
+        // the foreign `url`/`type` do not leak into the result.
+        let forced =
+            merge_json_fragment_with(existing, fragment, &keys, ".mcp.json", true).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&forced).unwrap();
+        let gh = &v["mcpServers"]["github-readonly"];
+        assert_eq!(gh["command"], "github-mcp");
+        assert!(
+            gh.get("url").is_none(),
+            "foreign url must not survive: {gh}"
+        );
     }
 
     #[test]

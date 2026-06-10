@@ -74,12 +74,18 @@ and backups land in `.agent-profile/` of that repo):
 ```bash
 SCRATCH=$(mktemp -d) && cp -R examples/.agent-profile "$SCRATCH/" && cd "$SCRATCH"
 git init -q . && printf '.agent-profile/state.json\n.agent-profile/backups/\n' > .gitignore
+git add -A && git commit -qm baseline   # commit a baseline so the round trip is measurable
 
 agent-profile apply --role reviewer --target claude-teammate --session-id run1-reviewer --json
 agent-profile current
 agent-profile teardown --session-id run1-reviewer
 git status --porcelain   # empty: byte-identical round trip
 ```
+
+(The `git commit` baseline matters: `git status --porcelain` reports untracked
+files too, so without a committed starting point the copied workspace and
+`.gitignore` would show up as `??` lines even though the apply→teardown cycle
+itself is a byte-identical round trip.)
 
 To see the drift refusal (design §4.5): create `.claude/agents/qa.md` by
 hand first, then `apply --role qa --target claude-teammate

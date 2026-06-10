@@ -176,6 +176,27 @@ pub fn marked_block(marker: &str, role: &str, context: &[String]) -> String {
     block
 }
 
+/// Is a marked block for this `marker` already present in `cur`?
+///
+/// Matches the exact marker, and — for a role-scoped marker (`role=<r>`, used
+/// by the render/diff plan) — any begin line carrying the same `role=<r>`
+/// attribute. This makes a session-tagged block written by `apply`
+/// (`session=<id> role=<r>`) satisfy the role-tagged render/diff plan, so
+/// `diff` reports clean after a pristine apply (design §2 + §3.2.5).
+fn marked_block_present(cur: &str, marker: &str) -> bool {
+    if cur.contains(&format!("<!-- agent-profile:begin {marker}")) {
+        return true;
+    }
+    if let Some(role) = marker.strip_prefix("role=") {
+        let needle = format!("role={role} -->");
+        return cur.lines().any(|line| {
+            let t = line.trim_start();
+            t.starts_with("<!-- agent-profile:begin ") && t.contains(&needle)
+        });
+    }
+    false
+}
+
 /// What `path` should contain after `action` runs against `current`
 /// (`None` = file does not exist). Used by `diff` now and `apply` in S4.
 pub fn desired_file_state(action: &Action, current: Option<&str>) -> Result<String, Error> {
@@ -196,7 +217,7 @@ pub fn desired_file_state(action: &Action, current: Option<&str>) -> Result<Stri
             marker, content, ..
         } => {
             let cur = current.unwrap_or("");
-            if cur.contains(&format!("<!-- agent-profile:begin {marker}")) {
+            if marked_block_present(cur, marker) {
                 return Ok(cur.to_string());
             }
             let mut out = cur.to_string();

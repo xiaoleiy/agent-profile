@@ -6,6 +6,11 @@ stdout. Every envelope carries `"schemaVersion": 1`. **Any breaking change to
 these shapes bumps `schemaVersion`** (design §2) — additive optional fields do
 not.
 
+The sole exception is `completions <shell>`: it always emits the raw shell
+completion script (the bytes you source into your shell), never a JSON
+envelope, regardless of `--json`. A completion script wrapped in JSON would be
+unusable, so `--json` is intentionally a no-op there.
+
 The examples below are real binary output, captured from the golden fixtures
 in `tests/golden/` and verified against the binary on every test run
 (`tests/json_contracts.rs`); they cannot rot. They were produced in a sandbox
@@ -139,6 +144,7 @@ envelope is `{ "schemaVersion": 1, "role": <r>, "profile": <parsed profile> }`.
         "url": "https://mcp.example.com/docs"
       },
       "github-readonly": {
+        "type": "stdio",
         "command": "github-mcp",
         "args": [
           "--readonly"
@@ -181,8 +187,23 @@ envelope is `{ "schemaVersion": 1, "role": <r>, "profile": <parsed profile> }`.
 ## `validate [--role <r>] --json`
 
 One result per validated unit. `ok` is the aggregate; exit 0 when true,
-exit 2 when false. `findings` entries are human-readable strings naming the
-file and key.
+exit 2 when false. Each `findings` entry is a structured object —
+`{ "code", "message", "file"?, "key"? }` — where `code` is the stable `Vxxx`
+code, `message` is the human-readable explanation, and `file`/`key` (present
+when known) name the workspace-relative file and the dotted key path. For
+example, a profile that embeds a literal token yields:
+
+```json
+{
+  "code": "V012",
+  "message": "env key `GITHUB_TOKEN` looks secret-bearing…",
+  "file": "profiles/leaky.yaml",
+  "key": "mcpServers.gh.env.GITHUB_TOKEN"
+}
+```
+
+The golden example below shows the all-clean case (every `findings` array
+empty).
 
 ```json
 {
@@ -398,7 +419,7 @@ with exit 3.
         "mcpServers.docs-search",
         "mcpServers.github-readonly"
       ],
-      "content": "{\n  \"mcpServers\": {\n    \"docs-search\": {\n      \"type\": \"http\",\n      \"url\": \"https://mcp.example.com/docs\"\n    },\n    \"github-readonly\": {\n      \"command\": \"github-mcp\",\n      \"args\": [\n        \"--readonly\"\n      ],\n      \"env\": {\n        \"GITHUB_TOKEN\": \"${env:GITHUB_PAT_RO}\"\n      }\n    }\n  }\n}\n",
+      "content": "{\n  \"mcpServers\": {\n    \"docs-search\": {\n      \"type\": \"http\",\n      \"url\": \"https://mcp.example.com/docs\"\n    },\n    \"github-readonly\": {\n      \"type\": \"stdio\",\n      \"command\": \"github-mcp\",\n      \"args\": [\n        \"--readonly\"\n      ],\n      \"env\": {\n        \"GITHUB_TOKEN\": \"${env:GITHUB_PAT_RO}\"\n      }\n    }\n  }\n}\n",
       "status": "applied"
     },
     {

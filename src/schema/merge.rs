@@ -26,6 +26,22 @@ pub struct ResolvedProfile {
 /// Resolve a profile: load it, resolve its one level of includes, and merge.
 pub fn resolve(ws: &Workspace, role: &str) -> Result<ResolvedProfile, Error> {
     let profile_src = ws.load_profile(role)?;
+    // Identity gate (design §1.1/§1.2, V003): a profile's identity is its
+    // filename stem and `name:` must equal it. render/diff/apply/doctor build
+    // provider file paths from `name`, so an unvalidated `name:` (e.g. one
+    // containing `../`) must never reach the adapters — enforce it here, not
+    // only in `validate`.
+    if profile_src.value.name != role {
+        return Err(Error::Validation(vec![Finding::new(
+            Code::NameStemMismatch,
+            format!(
+                "`name: {}` must equal the filename stem `{role}`",
+                profile_src.value.name
+            ),
+            Some(profile_src.rel.clone()),
+            Some("name".to_string()),
+        )]));
+    }
     resolve_loaded(ws, &profile_src)
 }
 
@@ -79,6 +95,20 @@ pub fn resolve_loaded(
         profile.capability_set(),
         &profile_src.rel,
     );
+
+    // Path-traversal guard on the merged references (design §1.2, §3.0): a
+    // `skills:`/`context:` value containing `../` (or an absolute path) must
+    // never reach the adapters, which build symlink/read paths from them.
+    let mut ref_findings = Vec::new();
+    crate::schema::validate::check_references(
+        set.skills.as_ref(),
+        set.context.as_ref(),
+        &profile_src.rel,
+        &mut ref_findings,
+    );
+    if !ref_findings.is_empty() {
+        return Err(Error::Validation(ref_findings));
+    }
 
     Ok(ResolvedProfile {
         profile: profile.clone(),

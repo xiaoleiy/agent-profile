@@ -77,6 +77,12 @@ pub enum Error {
     #[error("session/state error: {0}")]
     Session(String),
 
+    #[error(
+        "invalid --session-id `{id}`: a session id is used as a directory name under \
+         .agent-profile/backups/ and must not contain path separators or `..`"
+    )]
+    InvalidSessionId { id: String },
+
     #[error("failed to parse TOML at {path}: {message}")]
     TomlParse { path: PathBuf, message: String },
 
@@ -116,6 +122,7 @@ impl Error {
             | Error::UnknownTarget { .. }
             | Error::TargetNotAllowed { .. }
             | Error::SecretNotIgnored { .. }
+            | Error::InvalidSessionId { .. }
             | Error::Validation(_) => ExitCode::Validation,
             Error::Drift(_) | Error::ApplyDrift(_) | Error::TeardownDrift(_) => ExitCode::Drift,
             Error::Session(_) => ExitCode::Session,
