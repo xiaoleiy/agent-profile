@@ -1,0 +1,22 @@
+apiVersion: agent-profile/v1
+name: implementer
+description: Implementation worker with write access and TDD context.
+role: implementer
+targets: [claude-teammate, codex-agent]
+include: [models-high-reasoning]
+model:
+  claude: claude-fable-5
+  codex: gpt-5.5
+  effort: medium
+permissionMode: acceptEdits
+tools:
+  allow: [Read, Grep, Glob, Write, Edit, "Bash(cargo test:*)", "Bash(cargo build:*)", "Bash(git:*)"]
+  deny: ["Bash(git push:*)"]
+mcpServers:
+  github:
+    type: stdio
+    command: github-mcp
+    env:
+      GITHUB_TOKEN: ${env:GITHUB_PAT_RW}
+skills: [test-driven-development]
+context: [fragments/implementer-instructions.md]

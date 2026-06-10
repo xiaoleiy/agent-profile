@@ -1,0 +1,64 @@
+# .agent-profile/profiles/reviewer.yaml
+apiVersion: agent-profile/v1        # required; only "agent-profile/v1" accepted
+name: reviewer                      # required; must equal filename stem
+description: Read-only code reviewer for implement-review loops.   # required
+role: reviewer                      # required; free-form role label, surfaced in renders
+
+# Which runtime targets this profile may be rendered for. render/doctor/apply
+# reject targets not listed here.
+targets: [claude-subagent, claude-teammate, codex-agent]
+
+# Capability block includes. ONE level only: a capability block may not
+# include another block. Merge order: blocks in listed order, then the
+# profile's own keys win on conflict (scalar replace; maps deep-merge one
+# level; lists replace, not concat — predictable beats clever).
+include:
+  - mcp-github-readonly
+  - perms-readonly
+
+model:
+  claude: claude-fable-5            # model id passed to Claude targets
+  codex: gpt-5.3-codex              # model id for the Codex target
+  effort: high                      # optional: low|medium|high
+                                    #   claude → "effortLevel", codex → "model_reasoning_effort"
+
+permissionMode: readonly            # one of the profile-level postures:
+                                    #   readonly | plan | acceptEdits | auto | unrestricted
+                                    # adapters map this per target (see §3); doctor
+                                    # warns where a target cannot express it.
+
+tools:
+  allow:                            # canonical grammar = Claude rule grammar
+    - Read                          #   (Tool, Tool(specifier), Bash(cmd:*), mcp__server__tool)
+    - Grep                          # the Codex adapter translates to prefix_rule(...)
+    - "Bash(git diff:*)"            # where possible; doctor flags untranslatable rules.
+    - "Bash(git log:*)"
+  deny:
+    - Write
+    - Edit
+
+mcpServers:                         # same shapes as Claude/.mcp.json — we do NOT
+  github-readonly:                  # invent an MCP bundle format
+    type: stdio                     # stdio (default if omitted) | http
+    command: github-mcp
+    args: ["--readonly"]
+    env:
+      GITHUB_TOKEN: ${env:GITHUB_PAT_RO}   # secret-source indirection ONLY.
+                                           # Literal token-like values fail validate.
+  docs-search:
+    type: http
+    url: https://mcp.example.com/docs
+
+skills:                             # references to existing SKILL.md dirs; we do NOT
+  - code-review                     # invent a skills format. Resolution order:
+  - verification-before-completion  #   ~/.agents/skills/<name>/SKILL.md  (cross-tool store)
+                                    #   then <repo>/.agent-profile/skills/<name>/SKILL.md
+                                    # doctor errors if a referenced skill resolves nowhere.
+
+context:                            # instruction fragments layered into the role's
+  - fragments/reviewer-instructions.md   # context doc (CLAUDE.md/AGENTS.md overlay or
+                                         # subagent system prompt body, per target)
+
+metadata:                           # optional, opaque to rendering; carried into
+  owner: xiaolei                    # provenance comments
+  tags: [review, readonly]

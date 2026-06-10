@@ -1,0 +1,18 @@
+apiVersion: agent-profile/v1
+name: qa
+description: Verification worker — runs tests and browser checks, no source edits.
+role: qa
+targets: [claude-subagent, claude-teammate]
+permissionMode: plan
+model:
+  claude: claude-fable-5
+tools:
+  allow: [Read, Grep, "Bash(cargo test:*)", "Bash(npm test:*)", mcp__chrome-devtools__take_snapshot]
+  deny: [Write, Edit]
+mcpServers:
+  chrome-devtools:
+    type: stdio
+    command: npx
+    args: ["chrome-devtools-mcp"]
+skills: [verify]
+context: [fragments/qa-instructions.md]

@@ -1,0 +1,5 @@
+apiVersion: agent-profile/v1
+kind: capability
+name: models-high-reasoning
+model:
+  effort: high

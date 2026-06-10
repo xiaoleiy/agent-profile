@@ -2,3 +2,8 @@ target/
 .agent-profile/state.json
 .agent-profile/backups/
 .DS_Store
+
+
+# Added by cargo
+
+/target

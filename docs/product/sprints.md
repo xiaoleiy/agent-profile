@@ -158,3 +158,19 @@ steps beyond the tag push; probe scorecard live and dated.
   rather than blocking the sprint.
 - If the schedule compresses, cut from the end of S5 (S5-T6 can slip into S6)
   — never from S4's drift/teardown tests; reversibility is the trust feature.
+
+---
+
+## Deviations
+
+- **S1-T6 acceptance ("show --resolved for reviewer shows keys sourced from
+  both included blocks and the profile")**: the design §1.2 `reviewer.yaml`
+  example — reproduced verbatim in `examples/` per S1-T7 — explicitly sets
+  every mergeable key itself, so under the normative merge rule ("profile
+  wins over all blocks") every resolved key of `reviewer` is correctly
+  attributed to `profiles/reviewer.yaml`; no block-sourced value can survive.
+  The criterion is covered instead by a dedicated integration fixture
+  (`show_resolved_provenance_covers_blocks_and_profile` in `tests/cli.rs`)
+  where included blocks supply surviving keys and the resolved view
+  attributes keys to two blocks and the profile. `reviewer` is still
+  asserted to render provenance comments (`# from: profiles/reviewer.yaml`).

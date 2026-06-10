@@ -1,0 +1,11 @@
+# .agent-profile/capabilities/mcp-github-readonly.yaml
+apiVersion: agent-profile/v1
+kind: capability
+name: mcp-github-readonly
+mcpServers:
+  github-readonly:
+    type: stdio
+    command: github-mcp
+    args: ["--readonly"]
+    env:
+      GITHUB_TOKEN: ${env:GITHUB_PAT_RO}
