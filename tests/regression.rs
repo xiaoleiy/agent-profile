@@ -527,3 +527,318 @@ fn completions_json_emits_raw_script_not_envelope() {
         "must not be a JSON envelope"
     );
 }
+
+// ════════════════════════════════════════════════════════════════ round 2
+
+// ---------------------------------------------------------------- AREA2-03
+
+/// render --out and apply must enforce the same secret-literal scan as
+/// validate (design §1.2/§5.4): a profile embedding a live credential is
+/// refused with exit 2 and never materialized — neither into the --out
+/// sandbox nor into ~/.codex/config.toml.
+#[test]
+fn render_out_and_apply_refuse_secret_literal_profiles() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(home.join(".codex")).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    let st = std::process::Command::new("git")
+        .current_dir(&repo)
+        .args(["init", "-q"])
+        .status()
+        .unwrap();
+    assert!(st.success());
+    write(
+        &repo.join(".agent-profile/profiles/leaky.yaml"),
+        "apiVersion: agent-profile/v1\nname: leaky\ndescription: leaky\nrole: leaky\n\
+         targets: [codex-agent]\nmodel: {codex: gpt-5.5}\n\
+         mcpServers:\n  gh:\n    command: gh-mcp\n    env:\n      GITHUB_TOKEN: ghp_AbCdEf0123456789AbCdEf0123\n",
+    );
+    let ws = repo.join(".agent-profile");
+    let out = tmp.path().join("out");
+
+    cmd(&home)
+        .args(["validate", "--role", "leaky", "--dir"])
+        .arg(&ws)
+        .assert()
+        .code(2);
+    cmd(&home)
+        .current_dir(&repo)
+        .args([
+            "render",
+            "--role",
+            "leaky",
+            "--target",
+            "codex-agent",
+            "--out",
+        ])
+        .arg(&out)
+        .arg("--dir")
+        .arg(&ws)
+        .assert()
+        .code(2);
+    assert!(!out.exists() || fs::read_dir(&out).unwrap().next().is_none());
+    cmd(&home)
+        .current_dir(&repo)
+        .args([
+            "apply",
+            "--role",
+            "leaky",
+            "--target",
+            "codex-agent",
+            "--session-id",
+            "s1",
+            "--dir",
+        ])
+        .arg(&ws)
+        .assert()
+        .code(2);
+    let config = home.join(".codex/config.toml");
+    assert!(
+        !config.exists() || !fs::read_to_string(&config).unwrap().contains("ghp_"),
+        "live token written to ~/.codex/config.toml"
+    );
+}
+
+// ---------------------------------------------------------------- A3-R2-1
+
+/// diff after a clean teammate apply with a resolved `${env:VAR}` secret must
+/// be the post-apply clean-state check (exit 0) — not a false "foreign
+/// collision" error: apply wrote the materialized value (§5.5), so diff must
+/// compare against the same materialized content.
+#[test]
+fn diff_is_clean_after_teammate_apply_with_resolved_env_secret() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    let st = std::process::Command::new("git")
+        .current_dir(&repo)
+        .args(["init", "-q"])
+        .status()
+        .unwrap();
+    assert!(st.success());
+    fs::write(
+        repo.join(".gitignore"),
+        ".mcp.json\n.agent-profile/state.json\n.agent-profile/backups/\n",
+    )
+    .unwrap();
+    write(
+        &repo.join(".agent-profile/profiles/r.yaml"),
+        "apiVersion: agent-profile/v1\nname: r\ndescription: d\nrole: r\n\
+         targets: [claude-teammate]\n\
+         mcpServers:\n  gh:\n    type: stdio\n    command: github-mcp\n    env:\n      GITHUB_TOKEN: ${env:TOK}\n",
+    );
+    cmd(&home)
+        .current_dir(&repo)
+        .env("TOK", "ghp_aaaaaaaaaaaaaaaaaaaa")
+        .args([
+            "apply",
+            "--role",
+            "r",
+            "--target",
+            "claude-teammate",
+            "--session-id",
+            "s1",
+        ])
+        .assert()
+        .code(0);
+    cmd(&home)
+        .current_dir(&repo)
+        .env("TOK", "ghp_aaaaaaaaaaaaaaaaaaaa")
+        .args(["diff", "--role", "r", "--target", "claude-teammate"])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::is_empty());
+    // …and the clean no-edit teardown works without --force.
+    cmd(&home)
+        .current_dir(&repo)
+        .env("TOK", "ghp_aaaaaaaaaaaaaaaaaaaa")
+        .args(["teardown", "--session-id", "s1"])
+        .assert()
+        .code(0);
+}
+
+// ---------------------------------------------------------------- A3-R2-2
+
+/// A profile referencing a nonexistent context fragment is a profile-data
+/// error: validate flags it (V013, exit 2) and render/apply surface the same
+/// structured validation failure — never a raw I/O error (exit 1).
+#[test]
+fn missing_context_fragment_is_validation_error_not_io_error() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    write(
+        &tmp.path().join("repo/.agent-profile/profiles/r.yaml"),
+        "apiVersion: agent-profile/v1\nname: r\ndescription: d\nrole: r\n\
+         targets: [claude-subagent, claude-teammate]\ncontext: [fragments/nope.md]\n",
+    );
+    let ws = tmp.path().join("repo/.agent-profile");
+    cmd(&home)
+        .args(["validate", "--role", "r", "--dir"])
+        .arg(&ws)
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("V013"));
+    // Both targets fail identically — exit 2, no raw "I/O error".
+    for target in ["claude-subagent", "claude-teammate"] {
+        cmd(&home)
+            .args(["render", "--role", "r", "--target", target, "--dir"])
+            .arg(&ws)
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("I/O error").not());
+    }
+    cmd(&home)
+        .current_dir(tmp.path().join("repo"))
+        .args([
+            "apply",
+            "--role",
+            "r",
+            "--target",
+            "claude-subagent",
+            "--session-id",
+            "s1",
+            "--dir",
+        ])
+        .arg(&ws)
+        .assert()
+        .code(2);
+}
+
+// ---------------------------------------------------------------- A3-R2-3
+
+/// A pre-existing user key whose value happens to equal the profile's (here
+/// permissions.defaultMode: plan) is user-owned: apply must not adopt it, and
+/// teardown must leave it exactly as it was — no data loss on round-trip.
+#[test]
+fn teardown_preserves_preexisting_user_default_mode_with_equal_value() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(repo.join(".claude")).unwrap();
+    let st = std::process::Command::new("git")
+        .current_dir(&repo)
+        .args(["init", "-q"])
+        .status()
+        .unwrap();
+    assert!(st.success());
+    fs::write(
+        repo.join(".gitignore"),
+        ".agent-profile/state.json\n.agent-profile/backups/\n",
+    )
+    .unwrap();
+    let original = "{\"permissions\":{\"defaultMode\":\"plan\"}}\n";
+    fs::write(repo.join(".claude/settings.local.json"), original).unwrap();
+    write(
+        &repo.join(".agent-profile/profiles/r.yaml"),
+        "apiVersion: agent-profile/v1\nname: r\ndescription: d\nrole: r\n\
+         targets: [claude-teammate]\npermissionMode: plan\ntools:\n  allow: [Read]\n",
+    );
+    cmd(&home)
+        .current_dir(&repo)
+        .args([
+            "apply",
+            "--role",
+            "r",
+            "--target",
+            "claude-teammate",
+            "--session-id",
+            "s1",
+        ])
+        .assert()
+        .code(0);
+    cmd(&home)
+        .current_dir(&repo)
+        .args(["teardown", "--session-id", "s1"])
+        .assert()
+        .code(0);
+    assert_eq!(
+        fs::read_to_string(repo.join(".claude/settings.local.json")).unwrap(),
+        original,
+        "user's pre-existing permissions.defaultMode must survive apply/teardown"
+    );
+}
+
+// ---------------------------------------------------------------- AP4-R2-01
+
+/// Two teammate sessions sharing one repo: tearing down the first must not
+/// strip the deny rules / defaultMode the second still-active session
+/// depends on (cross-session refcount); tearing down the second removes them.
+#[test]
+fn teardown_refcounts_values_shared_with_another_active_session() {
+    let sb = sandbox_with_examples();
+    fs::create_dir_all(sb.home.join(".agents/skills/verify")).unwrap();
+    fs::write(sb.home.join(".agents/skills/verify/SKILL.md"), "# skill\n").unwrap();
+    fs::write(
+        sb.repo.join(".gitignore"),
+        ".agent-profile/state.json\n.agent-profile/backups/\n.mcp.json\n.claude/\nCLAUDE.md\n",
+    )
+    .unwrap();
+    let settings = sb.repo.join(".claude/settings.local.json");
+    let perms = |path: &Path| -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(&fs::read_to_string(path).unwrap()).unwrap()
+            ["permissions"]
+            .clone()
+    };
+    for (role, session) in [("reviewer", "s1"), ("qa", "s2")] {
+        cmd(&sb.home)
+            .current_dir(&sb.repo)
+            .env("GITHUB_PAT_RO", "x")
+            .args([
+                "apply",
+                "--role",
+                role,
+                "--target",
+                "claude-teammate",
+                "--session-id",
+                session,
+            ])
+            .assert()
+            .code(0);
+    }
+    assert_eq!(
+        perms(&settings)["deny"],
+        serde_json::json!(["Write", "Edit"])
+    );
+
+    // s1 down, s2 still active: a clean (no-edit) multi-session teardown
+    // works without --force, and s2's posture survives.
+    cmd(&sb.home)
+        .current_dir(&sb.repo)
+        .env("GITHUB_PAT_RO", "x")
+        .args(["teardown", "--session-id", "s1"])
+        .assert()
+        .code(0);
+    let p = perms(&settings);
+    assert_eq!(
+        p["deny"],
+        serde_json::json!(["Write", "Edit"]),
+        "active qa session's deny rules were stripped: {p}"
+    );
+    assert_eq!(p["defaultMode"], "plan");
+    // reviewer-only allow rules are gone; qa's remain.
+    let allow = p["allow"].as_array().unwrap();
+    assert!(allow.contains(&serde_json::json!("Bash(cargo test:*)")));
+    assert!(!allow.contains(&serde_json::json!("Bash(git diff:*)")));
+
+    // Last session out removes the shared values.
+    cmd(&sb.home)
+        .current_dir(&sb.repo)
+        .env("GITHUB_PAT_RO", "x")
+        .args(["teardown", "--session-id", "s2"])
+        .assert()
+        .code(0);
+    if settings.exists() {
+        let p = perms(&settings);
+        assert!(
+            p.get("deny")
+                .is_none_or(|d| d.as_array().unwrap().is_empty())
+        );
+        assert!(p.get("defaultMode").is_none());
+    }
+}

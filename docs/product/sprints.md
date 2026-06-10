@@ -326,3 +326,47 @@ steps beyond the tag push; probe scorecard live and dated.
   apply already gitignore-enforces, §5.5) and is no longer copyable out of
   `state.json`. Post-apply drift detection still relies on `hashAfter` first;
   the unresolved `content` is the fallback key-level check.
+
+- **Regression round 2 — render/diff/apply run the full validate gate
+  (AREA2-03, A3-R2-2)**: design §5.4 places the secret-literal scan under
+  `validate`, and §2's exit table reserves 2 for "validation failure". The
+  enforcement was inconsistent: render/apply rejected V001/V003 but skipped
+  the secret scan, so a profile validate refuses (inline `ghp_` token) was
+  written verbatim to `--out` sandboxes and `~/.codex/config.toml`.
+  `build_plan` (the shared front half of render/diff/apply) now runs the
+  full `validate` unit report and refuses with exit 2 on any finding — a
+  profile that fails `validate` is never materialized anywhere. New code
+  **V013** (`context:` fragment file does not exist) extends "include
+  resolution" to fragments: previously validate passed a profile whose
+  fragment the claude-subagent renderer could not read, surfacing as a raw
+  I/O error (exit 1) instead of a validation failure (exit 2).
+
+- **Regression round 2 — diff/teardown compare materialized `.mcp.json`
+  content (A3-R2-1)**: §5.5 has apply resolve `${env:VAR}` into a gitignored
+  `.mcp.json` while state.json keeps the reference. diff and the pre-teardown
+  intact-check compared the on-disk *resolved* value against the *unresolved*
+  fragment and misclassified the tool's own key as a foreign collision
+  (exit 3 after a pristine apply). Both now resolve set env references the
+  same way apply does before comparing, so `diff` is the §2 post-apply
+  clean-state check (exit 0) and clean teardowns no longer need `--force`.
+
+- **Regression round 2 — pre-existing identical keys are not adopted
+  (A3-R2-3)**: §3.2.2 says "existing keys we did not create are never
+  modified — a name collision is a drift error". When the existing value
+  *equals* the profile's (user already had `defaultMode: plan`), apply is not
+  modifying anything, so instead of refusing (exit 3) we chose the safer
+  reading: the key is recorded as pre-existing (not ours), the merge is a
+  no-op for it, and teardown leaves it untouched. The user's key survives a
+  full apply/teardown round-trip byte-for-byte; list entries already behaved
+  this way via the `appended` tracking.
+
+- **Regression round 2 — cross-session refcounting at teardown
+  (AP4-R2-01)**: §3.4 "remove exactly the recorded keys" silently weakened a
+  second still-active session sharing the same repo (teardown of s1 stripped
+  the `deny` rules and `defaultMode` s2 still required). Apply now records a
+  *shared claim* when a merged key/entry already exists and another active
+  session recorded it (a pre-existing value no session recorded stays
+  user-owned and is never recorded); teardown skips keys/entries any other
+  active session still claims — the last session out removes them. Worktree
+  isolation remains the recommended setup (§3.2.3); this makes the shared-repo
+  fallback safe instead of silently lossy.

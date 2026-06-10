@@ -35,6 +35,8 @@ pub enum Code {
     SecretHighEntropy,
     /// V012 — secret-named key whose value is not a `${env:…}` reference.
     SecretNamedKey,
+    /// V013 — `context:` fragment file does not exist in the workspace.
+    MissingFragment,
 }
 
 impl Code {
@@ -52,6 +54,7 @@ impl Code {
             Code::SecretTokenPrefix => "V010",
             Code::SecretHighEntropy => "V011",
             Code::SecretNamedKey => "V012",
+            Code::MissingFragment => "V013",
         }
     }
 
@@ -181,6 +184,7 @@ pub fn validate_role(ws: &Workspace, role: &str) -> Result<UnitReport, Error> {
         &src.rel,
         &mut report.findings,
     );
+    check_fragments(ws, profile.context.as_ref(), &src.rel, &mut report.findings);
 
     for include in &profile.include {
         match validate_capability(ws, include) {
@@ -263,6 +267,7 @@ pub fn validate_capability(ws: &Workspace, name: &str) -> Result<UnitReport, Err
         &src.rel,
         &mut report.findings,
     );
+    check_fragments(ws, block.context.as_ref(), &src.rel, &mut report.findings);
 
     Ok(report)
 }
@@ -341,6 +346,37 @@ pub fn check_references(
                     Some("context".to_string()),
                 ));
             }
+        }
+    }
+}
+
+/// A `context:` fragment must resolve to a file inside the workspace
+/// (design §1.2/§2 — include resolution is validate's job): the
+/// claude-subagent adapter inlines the fragment at render time, so a profile
+/// validate accepts must be renderable for every listed target — a missing
+/// fragment is a validation failure (exit 2), never a raw I/O error
+/// (regression A3-R2-2).
+fn check_fragments(
+    ws: &Workspace,
+    context: Option<&Vec<String>>,
+    rel: &str,
+    findings: &mut Vec<Finding>,
+) {
+    let Some(context) = context else { return };
+    for fragment in context {
+        if !is_safe_context_path(fragment) {
+            continue; // already a V009 finding
+        }
+        if !ws.root().join(fragment).is_file() {
+            findings.push(Finding::new(
+                Code::MissingFragment,
+                format!(
+                    "context fragment `{fragment}` does not exist (expected \
+                     .agent-profile/{fragment})"
+                ),
+                Some(rel.to_string()),
+                Some("context".to_string()),
+            ));
         }
     }
 }

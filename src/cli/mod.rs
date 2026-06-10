@@ -417,6 +417,14 @@ fn build_plan(
     let target = Target::parse(&rt.target).ok_or_else(|| Error::UnknownTarget {
         target: rt.target.clone(),
     })?;
+    // render/diff/apply enforce the same gate as `validate` (design §1.2/§5.4:
+    // schema, includes, reference safety, secret-literal scan): a profile that
+    // `validate` refuses is never materialized to disk — neither into a
+    // sandbox (`--out`) nor into provider files (regression AREA2-03/A3-R2-2).
+    let report = validate::validate_role(&ws, &rt.role)?;
+    if !report.ok() {
+        return Err(Error::Validation(report.findings));
+    }
     let resolved = merge::resolve(&ws, &rt.role)?;
     if !resolved.profile.targets.contains(&target) {
         return Err(Error::TargetNotAllowed {
@@ -573,7 +581,29 @@ fn cmd_diff(cli: &Cli, rt: &RoleTargetArgs, scope: Scope) -> Result<ExitCode, Er
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                     Err(source) => return Err(Error::Io { path: abs, source }),
                 };
-                let desired = adapters::desired_file_state(action, current.as_deref())?;
+                // §5.5: apply materializes set `${env:VAR}` refs into a
+                // gitignored `.mcp.json`. diff must compare against the same
+                // materialized content, or it would misread the key it wrote
+                // itself as a foreign collision (regression A3-R2-1).
+                let desired = match action {
+                    Action::MergeKeys {
+                        path,
+                        keys,
+                        content,
+                    } => {
+                        let effective = state::resolve_mcp_env(content, &abs, &ctx.repo_root)
+                            .unwrap_or_else(|_not_ignored| content.clone());
+                        adapters::desired_file_state(
+                            &Action::MergeKeys {
+                                path: path.clone(),
+                                keys: keys.clone(),
+                                content: effective,
+                            },
+                            current.as_deref(),
+                        )?
+                    }
+                    _ => adapters::desired_file_state(action, current.as_deref())?,
+                };
                 (current.unwrap_or_default(), desired)
             }
         };
@@ -727,7 +757,7 @@ fn cmd_apply(
         )));
     }
 
-    let outcome = match state::execute_apply(&plan, &ctx, session_id, force) {
+    let outcome = match state::execute_apply(&plan, &ctx, session_id, force, &ledger.sessions) {
         Ok(outcome) => outcome,
         // §4.5 drift refusal: message + suggested commands, exit 3.
         Err(Error::ApplyDrift(msgs)) => {
@@ -924,7 +954,7 @@ fn cmd_teardown(
     let mut drifted: Vec<(String, Vec<String>)> = Vec::new();
     for id in &ids {
         let session = ledger.sessions.get(id).expect("id from ledger").clone();
-        match state::execute_teardown(&session, id, &ctx, force) {
+        match state::execute_teardown(&session, id, &ctx, force, &ledger.sessions) {
             Ok(steps) => {
                 ledger.sessions.remove(id);
                 state::save(ws.root(), &ledger)?;

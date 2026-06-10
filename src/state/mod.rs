@@ -231,6 +231,41 @@ fn env_refs(s: &str) -> Vec<String> {
     vars
 }
 
+/// `content` with every *set* `${env:VAR}` reference replaced by its value.
+/// Unset variables keep the reference (the pattern Claude itself supports).
+fn substitute_set_env(content: &str) -> String {
+    let mut out = content.to_string();
+    for name in env_refs(content) {
+        if let Ok(val) = std::env::var(&name) {
+            out = out.replace(&format!("${{env:{name}}}"), &val);
+        }
+    }
+    out
+}
+
+/// §5.5 materialization rule for `.mcp.json` merge content, shared by apply
+/// (writes the result) and diff (compares against it — regression A3-R2-1):
+/// set `${env:VAR}` references resolve into the written value **only if** the
+/// target file is gitignored. `Err(vars)` = the file is not gitignored, so
+/// materializing those variables is forbidden. Non-`.mcp.json` paths and
+/// contents without set references pass through unchanged.
+pub fn resolve_mcp_env(content: &str, abs: &Path, repo_root: &Path) -> Result<String, Vec<String>> {
+    if abs.file_name().is_none_or(|n| n != ".mcp.json") {
+        return Ok(content.to_string());
+    }
+    let set_vars: Vec<String> = env_refs(content)
+        .into_iter()
+        .filter(|v| std::env::var(v).is_ok())
+        .collect();
+    if set_vars.is_empty() {
+        return Ok(content.to_string());
+    }
+    if !is_git_ignored(repo_root, abs) {
+        return Err(set_vars);
+    }
+    Ok(substitute_set_env(content))
+}
+
 /// Can `abs` end up committed from `repo_root`? Files outside the repo cannot;
 /// inside, `git check-ignore` decides (design §5.5). A non-git directory is
 /// conservatively treated as not ignored.
@@ -290,11 +325,17 @@ struct Prep {
 
 /// Interpret a plan against the filesystem: per-action backup + hash
 /// recording, atomic writes, executor-level denylist, mid-apply rollback.
+/// `active` is the ledger's currently active sessions (before this apply):
+/// keys/entries they recorded are session-owned, so a value this plan merges
+/// that already exists is recorded as a shared claim and refcounted at
+/// teardown — while a pre-existing value no session recorded is user-owned
+/// and never recorded (regressions A3-R2-3 / AP4-R2-01).
 pub fn execute_apply(
     plan: &Plan,
     ctx: &PlanContext,
     session_id: &str,
     force: bool,
+    active: &BTreeMap<String, Session>,
 ) -> Result<ApplyOutcome, Error> {
     let preps = precheck(plan, ctx, force)?;
 
@@ -315,7 +356,8 @@ pub fn execute_apply(
             failure = Some(Error::NeverTouch { path: abs });
             break;
         }
-        match execute_one(action, prep, ctx, &abs, &backup_root) {
+        let prior = merge_records_for_path(active, None, action.path());
+        match execute_one(action, prep, ctx, &abs, &backup_root, &prior) {
             Ok(ex) => executed.push(ex),
             Err(e) => {
                 failure = Some(e);
@@ -363,26 +405,17 @@ fn precheck(plan: &Plan, ctx: &PlanContext, force: bool) -> Result<Vec<Prep>, Er
                 }
             }
             Action::MergeKeys { keys, content, .. } => {
-                let mut effective = content.clone();
                 // §5.5: resolved secrets may only land in gitignored files;
                 // only Claude `.mcp.json` env maps materialize.
-                if abs.file_name().is_some_and(|n| n == ".mcp.json") {
-                    let set_vars: Vec<(String, String)> = env_refs(content)
-                        .into_iter()
-                        .filter_map(|v| std::env::var(&v).ok().map(|val| (v, val)))
-                        .collect();
-                    if !set_vars.is_empty() {
-                        if !is_git_ignored(&ctx.repo_root, &abs) {
-                            return Err(Error::SecretNotIgnored {
-                                path: action.path().to_string(),
-                                vars: set_vars.into_iter().map(|(v, _)| v).collect(),
-                            });
-                        }
-                        for (name, val) in &set_vars {
-                            effective = effective.replace(&format!("${{env:{name}}}"), val);
-                        }
+                let effective = match resolve_mcp_env(content, &abs, &ctx.repo_root) {
+                    Ok(resolved) => resolved,
+                    Err(vars) => {
+                        return Err(Error::SecretNotIgnored {
+                            path: action.path().to_string(),
+                            vars,
+                        });
                     }
-                }
+                };
                 let current = read_opt(&abs)?;
                 let cur = current.as_deref().unwrap_or("");
                 let merged = if is_toml(action.path()) {
@@ -443,12 +476,100 @@ struct Executed {
     created_dirs: Vec<PathBuf>,
 }
 
+/// The merge-keys records other active sessions hold for `path`, excluding
+/// `skip_id`'s own. This is the cross-session ownership index used both at
+/// apply (shared-claim detection) and at teardown (refcounting).
+fn merge_records_for_path<'a>(
+    sessions: &'a BTreeMap<String, Session>,
+    skip_id: Option<&str>,
+    path: &str,
+) -> Vec<&'a ActionRecord> {
+    sessions
+        .iter()
+        .filter(|(id, _)| skip_id != Some(id.as_str()))
+        .flat_map(|(_, s)| s.actions.iter())
+        .filter(|r| r.op == "merge-keys" && r.path == path)
+        .collect()
+}
+
+/// Is `key` recorded (owned or claimed) by any of `records`?
+fn key_claimed(records: &[&ActionRecord], key: &str) -> bool {
+    records.iter().any(|r| {
+        r.keys
+            .as_ref()
+            .is_some_and(|ks| ks.iter().any(|k| k == key))
+    })
+}
+
+/// Is array entry `item` at `base` recorded as appended/claimed by any of
+/// `records`?
+fn entry_claimed(records: &[&ActionRecord], base: &str, item: &serde_json::Value) -> bool {
+    records.iter().any(|r| {
+        r.appended
+            .as_ref()
+            .and_then(|m| m.get(base))
+            .is_some_and(|v| v.contains(item))
+    })
+}
+
+/// Does `current` already carry exactly the value our fragment sets at `key`?
+fn pre_existing_identical(current: &str, effective: &str, key: &str, path: &str) -> bool {
+    if is_toml(path) {
+        let (Ok(cur), Ok(frag)) = (current.parse::<DocMut>(), effective.parse::<DocMut>()) else {
+            return false;
+        };
+        match (
+            toml_item_at(cur.as_item(), key),
+            toml_item_at(frag.as_item(), key),
+        ) {
+            (Some(c), Some(f)) => c.to_string().trim() == f.to_string().trim(),
+            _ => false,
+        }
+    } else {
+        let (Ok(cur), Ok(frag)) = (
+            serde_json::from_str::<serde_json::Value>(current),
+            serde_json::from_str::<serde_json::Value>(effective),
+        ) else {
+            return false;
+        };
+        match (json_at(&cur, key), json_at(&frag, key)) {
+            (Some(c), Some(f)) => c == f,
+            _ => false,
+        }
+    }
+}
+
+/// The non-append keys this session records at `path` (design §3.2.2 "keys we
+/// add"; regression A3-R2-3): a key whose identical value already existed is
+/// NOT ours — unless another active session recorded it, in which case we
+/// record a shared claim so teardown refcounts it (the last session out
+/// removes the key; a user-owned pre-existing key is never recorded and never
+/// removed). `…[+N]` keys always stay — their entries are tracked
+/// individually via `appended`.
+fn owned_keys(
+    current: &str,
+    effective: &str,
+    keys: &[String],
+    path: &str,
+    prior: &[&ActionRecord],
+) -> Vec<String> {
+    keys.iter()
+        .filter(|key| {
+            key.contains("[+")
+                || !pre_existing_identical(current, effective, key, path)
+                || key_claimed(prior, key)
+        })
+        .cloned()
+        .collect()
+}
+
 fn execute_one(
     action: &Action,
     prep: &Prep,
     ctx: &PlanContext,
     abs: &Path,
     backup_root: &Path,
+    prior: &[&ActionRecord],
 ) -> Result<Executed, Error> {
     let created_dirs = missing_ancestors(abs);
     let mut record = ActionRecord::new(action.op(), action.path());
@@ -497,10 +618,16 @@ fn execute_one(
                 )?
             };
             if !is_toml(action.path()) {
-                record.appended = compute_appended(current.as_deref(), effective, keys);
+                record.appended = compute_appended(current.as_deref(), effective, keys, prior);
             }
             atomic_write(abs, &merged)?;
-            record.keys = Some(keys.clone());
+            record.keys = Some(owned_keys(
+                current.as_deref().unwrap_or(""),
+                effective,
+                keys,
+                action.path(),
+                prior,
+            ));
             record.hash_after = Some(sha256_of(&merged));
             // §5.5 secret hygiene: persist the UNRESOLVED fragment (with the
             // `${env:VAR}` reference intact), never the materialized secret —
@@ -571,11 +698,16 @@ fn rollback(executed: &[Executed]) {
     }
 }
 
-/// Which array entries a JSON merge will actually append per `…[+N]` key.
+/// Which array entries a JSON merge actually appends per `…[+N]` key, plus —
+/// for entries already present — a shared claim when another active session
+/// appended that entry (cross-session refcount, regression AP4-R2-01). An
+/// entry that pre-existed and is claimed by no session is user-owned and not
+/// recorded, so teardown never removes it.
 fn compute_appended(
     current: Option<&str>,
     effective: &str,
     keys: &[String],
+    prior: &[&ActionRecord],
 ) -> Option<BTreeMap<String, Vec<serde_json::Value>>> {
     let arr_paths: Vec<String> = keys
         .iter()
@@ -589,20 +721,20 @@ fn compute_appended(
         .and_then(|c| serde_json::from_str(c).ok())
         .unwrap_or(serde_json::json!({}));
     let mut map = BTreeMap::new();
-    for path in arr_paths {
-        let Some(frag_arr) = json_at(&frag, &path).and_then(|v| v.as_array()) else {
+    for base in arr_paths {
+        let Some(frag_arr) = json_at(&frag, &base).and_then(|v| v.as_array()) else {
             continue;
         };
         let empty = Vec::new();
-        let cur_arr = json_at(&cur, &path)
+        let cur_arr = json_at(&cur, &base)
             .and_then(|v| v.as_array())
             .unwrap_or(&empty);
         let added: Vec<serde_json::Value> = frag_arr
             .iter()
-            .filter(|item| !cur_arr.contains(item))
+            .filter(|item| !cur_arr.contains(item) || entry_claimed(prior, &base, item))
             .cloned()
             .collect();
-        map.insert(path, added);
+        map.insert(base, added);
     }
     Some(map)
 }
@@ -630,11 +762,15 @@ pub struct TeardownStep {
 /// target-verified unlink, marker-scoped block removal. Post-apply drift
 /// refuses without `force`; `force` falls back to backup restore (owned) /
 /// best-effort key-level (merges). Deletes the session's backups at the end.
+/// `active` is the full ledger: keys/entries another still-active session
+/// recorded for the same path are preserved (cross-session refcount,
+/// regression AP4-R2-01) — the last session out removes them.
 pub fn execute_teardown(
     session: &Session,
     session_id: &str,
     ctx: &PlanContext,
     force: bool,
+    active: &BTreeMap<String, Session>,
 ) -> Result<Vec<TeardownStep>, Error> {
     if !force {
         let drifted = verify_session(session, ctx)?;
@@ -650,7 +786,8 @@ pub fn execute_teardown(
         if denylist::is_never_touch(&abs, &ctx.home) {
             return Err(Error::NeverTouch { path: abs });
         }
-        if let Some(step) = teardown_one(record, ctx, &abs, force)? {
+        let claims = merge_records_for_path(active, Some(session_id), &record.path);
+        if let Some(step) = teardown_one(record, ctx, &abs, force, &claims)? {
             steps.push(step);
         }
         if let Some(dirs) = &record.created_dirs {
@@ -706,9 +843,22 @@ fn verify_session(session: &Session, ctx: &PlanContext) -> Result<Vec<String>, E
 
 /// Are the values this merge wrote still what we wrote? Keys removed by the
 /// user are fine (reversal becomes a no-op); keys *changed* are drift.
+/// For `.mcp.json` the recorded fragment keeps `${env:VAR}` references while
+/// the on-disk file carries the materialized value (§5.5) — compare like with
+/// like by resolving set references before the comparison.
 fn merge_keys_intact(current: &str, record: &ActionRecord) -> bool {
     let (Some(keys), Some(fragment)) = (&record.keys, &record.content) else {
         return false;
+    };
+    let resolved_fragment;
+    let fragment: &str = if Path::new(&record.path)
+        .file_name()
+        .is_some_and(|n| n == ".mcp.json")
+    {
+        resolved_fragment = substitute_set_env(fragment);
+        &resolved_fragment
+    } else {
+        fragment
     };
     if is_toml(&record.path) {
         let (Ok(cur), Ok(frag)) = (
@@ -762,6 +912,7 @@ fn teardown_one(
     ctx: &PlanContext,
     abs: &Path,
     force: bool,
+    claims: &[&ActionRecord],
 ) -> Result<Option<TeardownStep>, Error> {
     let backup_abs = record.backup.as_ref().map(|b| ctx.resolve(b));
     let step = |op: &str, detail: String| {
@@ -795,7 +946,7 @@ fn teardown_one(
             };
             let keys = record.keys.clone().unwrap_or_default();
             let backup_text = backup_abs.as_deref().map(read_opt).transpose()?.flatten();
-            let removed = remove_recorded_keys(&cur, record, backup_text.as_deref());
+            let removed = remove_recorded_keys(&cur, record, backup_text.as_deref(), claims);
             let result = match removed {
                 Ok(r) => r,
                 // Best-effort under --force: fall back to full backup restore.
@@ -879,11 +1030,14 @@ fn semantically_equal(a: &str, b: &str, path: &str) -> bool {
 /// Remove exactly the recorded keys (design §3.4): leaf keys removed,
 /// `…[+N]` paths lose exactly the entries we appended, parents we introduced
 /// are pruned when empty — everything else (foreign keys, later foreign
-/// additions) is preserved.
+/// additions) is preserved. Keys/entries another still-active session also
+/// recorded (`claims`) are left in place: the last session out removes them
+/// (regression AP4-R2-01).
 fn remove_recorded_keys(
     current: &str,
     record: &ActionRecord,
     backup: Option<&str>,
+    claims: &[&ActionRecord],
 ) -> Result<String, Error> {
     let keys = record.keys.as_deref().unwrap_or(&[]);
     if is_toml(&record.path) {
@@ -896,6 +1050,9 @@ fn remove_recorded_keys(
                 })?;
         let pre: DocMut = backup.unwrap_or("").parse().unwrap_or_default();
         for key in keys {
+            if key_claimed(claims, key) {
+                continue; // another active session still needs it
+            }
             toml_remove_at(&mut doc, key, &pre);
         }
         Ok(doc.to_string())
@@ -917,6 +1074,9 @@ fn remove_recorded_keys(
                     && let Some(added) = appended.get(base)
                 {
                     for item in added {
+                        if entry_claimed(claims, base, item) {
+                            continue; // refcounted: still required elsewhere
+                        }
                         if let Some(pos) = arr.iter().position(|x| x == item) {
                             arr.remove(pos);
                         }
@@ -931,6 +1091,9 @@ fn remove_recorded_keys(
                     json_remove_at(&mut v, base);
                 }
             } else {
+                if key_claimed(claims, key) {
+                    continue; // another active session still needs it
+                }
                 json_remove_at(&mut v, key);
             }
         }
@@ -1248,7 +1411,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let err = execute_apply(&plan, &ctx, "s1", false).unwrap_err();
+        let err = execute_apply(&plan, &ctx, "s1", false, &BTreeMap::new()).unwrap_err();
         assert!(matches!(err, Error::NeverTouch { .. }), "got {err:?}");
         // Rollback: the first create is undone, including its directories.
         assert!(!tmp.path().join(".claude/agents/x.md").exists());
@@ -1285,7 +1448,7 @@ mod tests {
             ..Default::default()
         };
         let before = std::fs::read_to_string(tmp.path().join(".mcp.json")).unwrap();
-        let err = execute_apply(&plan, &ctx, "s1", false).unwrap_err();
+        let err = execute_apply(&plan, &ctx, "s1", false, &BTreeMap::new()).unwrap_err();
         assert!(matches!(err, Error::Io { .. }), "got {err:?}");
         assert!(!tmp.path().join(".claude/agents/x.md").exists());
         assert_eq!(
@@ -1322,7 +1485,7 @@ mod tests {
             ..ActionRecord::new("merge-keys", ".mcp.json")
         };
         let current = "{\n  \"mcpServers\": {\n    \"gh\": {\n      \"command\": \"x\"\n    }\n  },\n  \"foreign\": true\n}\n";
-        let out = remove_recorded_keys(current, &record, None).unwrap();
+        let out = remove_recorded_keys(current, &record, None, &[]).unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v, serde_json::json!({ "foreign": true }));
     }
@@ -1346,7 +1509,7 @@ mod tests {
         };
         let backup = "{ \"permissions\": { \"allow\": [\"Read\"] } }";
         let current = "{ \"permissions\": { \"allow\": [\"Read\", \"Grep\", \"Foreign\"], \"defaultMode\": \"plan\" } }";
-        let out = remove_recorded_keys(current, &record, Some(backup)).unwrap();
+        let out = remove_recorded_keys(current, &record, Some(backup), &[]).unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(
             v,
@@ -1364,7 +1527,7 @@ mod tests {
         let current = "# comment survives\nmodel = \"gpt-5.5\"\n\n[marketplaces.x]\nsource = \"git\"\n\n[mcp_servers.github]\ncommand = \"github-mcp\"\n";
         let backup =
             "# comment survives\nmodel = \"gpt-5.5\"\n\n[marketplaces.x]\nsource = \"git\"\n";
-        let out = remove_recorded_keys(current, &record, Some(backup)).unwrap();
+        let out = remove_recorded_keys(current, &record, Some(backup), &[]).unwrap();
         assert_eq!(out.trim(), backup.trim());
     }
 
