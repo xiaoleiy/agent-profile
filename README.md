@@ -267,7 +267,14 @@ build contract: `docs/product/design.md`). Working today, end-to-end:
   captured render/apply/teardown walkthrough in
   [`docs/dogfood.md`](docs/dogfood.md).
 
-Not yet done (sprint S6): CI workflow, release automation, Homebrew/crates.io
+CI is live (`.github/workflows/ci.yml`): fmt, clippy `-D warnings`, the full
+test suite, the sandboxed smoke cycle, and a zsh-completions load check, on
+Ubuntu and macOS. Tag-triggered release builds
+(`.github/workflows/release.yml`: macOS arm64/x86_64, Linux x86_64/arm64
+tarballs + sha256 checksums) and GitHub Pages deploys of `site/`
+(`.github/workflows/pages.yml`) are wired but no release tag has been cut yet.
+
+Not yet done (sprint S6): first tagged release, Homebrew/crates.io
 distribution, probe scorecard (`docs/probe.md`).
 
 ## Docs

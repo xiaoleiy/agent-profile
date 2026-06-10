@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test
+
+      - name: smoke suite (sandboxed full cycle)
+        run: scripts/smoke.sh
+
+      # Deferred S5-T2 acceptance criterion: generated zsh completions must
+      # load cleanly (syntax check + compinit + forced function load).
+      - name: zsh completions load
+        run: |
+          if ! command -v zsh >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq zsh
+          fi
+          mkdir -p "$RUNNER_TEMP/zfunc"
+          cargo run --quiet -- completions zsh > "$RUNNER_TEMP/zfunc/_agent-profile"
+          zsh -n "$RUNNER_TEMP/zfunc/_agent-profile"
+          zsh -fc '
+            fpath=("$1" $fpath)
+            autoload -Uz compinit
+            compinit -u -d "$1/.zcompdump"
+            autoload -Uz +X _agent-profile
+          ' zsh "$RUNNER_TEMP/zfunc"
