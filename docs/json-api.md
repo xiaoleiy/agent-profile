@@ -259,6 +259,12 @@ fields the target cannot express (never silently dropped), each with the
 nearest workaround in `hint`. `notes` (optional) carries honest-limitation
 notes. With `--out <dir>`, an `outDir` field is added.
 
+`symlink` actions carry `linkTarget`: the location the referenced skill
+actually resolved to, following the design §1.2 order — usually
+`~/.agents/skills/<name>` (cross-tool store), or a repo-relative path like
+`.agent-profile/skills/<name>` when the skill resolves only via the repo
+fallback.
+
 ```json
 {
   "schemaVersion": 1,

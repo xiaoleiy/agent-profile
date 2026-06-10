@@ -39,7 +39,12 @@ impl RenderTarget for ClaudeSubagent {
         if let Some(skills) = r.set.skills.as_ref().filter(|s| !s.is_empty()) {
             let lines: Vec<String> = skills
                 .iter()
-                .map(|s| format!("Use the {s} skill (see ~/.agents/skills/{s}/SKILL.md)."))
+                .map(|s| {
+                    format!(
+                        "Use the {s} skill (see {}/SKILL.md).",
+                        skill_link_target(ctx, s)
+                    )
+                })
                 .collect();
             sections.push(format!("{}\n", lines.join("\n")));
         }
@@ -108,12 +113,14 @@ impl RenderTarget for ClaudeTeammate {
             );
         }
 
-        // 4. Skills (§3.2.4): symlinks into the cross-tool store; never copy.
+        // 4. Skills (§3.2.4): symlinks to wherever the skill actually
+        //    resolves (§1.2 order: ~/.agents/skills store, then the repo
+        //    fallback doctor validates — regression A3-R3-2); never copy.
         if let Some(skills) = r.set.skills.as_ref() {
             for skill in skills {
                 actions.push(Action::Symlink {
                     path: format!(".claude/skills/{skill}"),
-                    link_target: format!("~/.agents/skills/{skill}"),
+                    link_target: skill_link_target(ctx, skill),
                 });
             }
         }
@@ -142,6 +149,33 @@ impl RenderTarget for ClaudeTeammate {
             notes,
         })
     }
+}
+
+/// Where a referenced skill resolves, mirroring doctor's §1.2 order:
+/// `~/.agents/skills/<name>/SKILL.md`, then the repo fallback
+/// `<workspace>/skills/<name>/SKILL.md`. A skill doctor green-lights must
+/// produce a working symlink (regression A3-R3-2); an unresolvable skill
+/// keeps the store target (doctor reports it as an error).
+fn skill_link_target(ctx: &PlanContext, skill: &str) -> String {
+    if ctx
+        .home
+        .join(".agents/skills")
+        .join(skill)
+        .join("SKILL.md")
+        .is_file()
+    {
+        return format!("~/.agents/skills/{skill}");
+    }
+    let fallback = ctx.workspace_root.join("skills").join(skill);
+    if fallback.join("SKILL.md").is_file() {
+        // Display path: repo-relative when possible (the usual layout),
+        // absolute otherwise (`--dir` pointing outside the repo).
+        return match fallback.strip_prefix(&ctx.repo_root) {
+            Ok(rel) => rel.display().to_string(),
+            Err(_) => fallback.display().to_string(),
+        };
+    }
+    format!("~/.agents/skills/{skill}")
 }
 
 fn agent_md_path(scope: Scope, role: &str) -> String {

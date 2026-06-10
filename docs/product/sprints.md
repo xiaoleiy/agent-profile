@@ -370,3 +370,41 @@ steps beyond the tag push; probe scorecard live and dated.
   active session still claims — the last session out removes them. Worktree
   isolation remains the recommended setup (§3.2.3); this makes the shared-repo
   fallback safe instead of silently lossy.
+
+- **Regression round 3 — diff on a session-owned `${env:VAR}` mcp key
+  (A3-R3-1)**: §2 frames diff as "rendered output vs what is on disk right
+  now", but rendering `.mcp.json` content faithfully requires the apply-time
+  value of every `${env:VAR}` reference, which state.json deliberately never
+  stores (§5.5 — no materialized secrets in the ledger). With the variable
+  unset or rotated in the diffing shell, a literal re-render misattributed
+  the tool's own key as a foreign collision (§3.2.2 reserves collisions for
+  "existing keys we did not create"). Chosen behavior: a merge key recorded
+  by an active session whose *unresolved* fragment still equals the plan's,
+  and whose on-disk value matches the recorded fragment modulo `${env:VAR}`
+  materialization, is owned-and-clean — diff adopts the on-disk value (exit
+  0, empty `diffs` in `--json`). Consequence, stated honestly: once the
+  variable is unset/rotated, an in-place edit of only the materialized
+  secret value is indistinguishable from legitimate materialization and is
+  reported clean (whole-file edits still surface as ordinary unified diffs;
+  teardown's `hashAfter` check is unaffected). A genuinely foreign key —
+  one no active session recorded — still collides (exit 3).
+
+- **Regression round 3 — teardown of a forced merge restores the backed-up
+  key (AREA2-R3-01)**: §3.4 "merge-keys → remove exactly the recorded keys"
+  is destructive when the recorded key was a *foreign* value that `apply
+  --force` overwrote (§5.1 backs it up precisely so it can come back).
+  Teardown now restores a recorded key from the session backup whenever the
+  backup holds a different value than the one we wrote, and removes it
+  otherwise (creations, and shared claims where the last session out
+  removes) — making the merge-keys `--force` path consistent with the
+  owned-file path and with §3.2 "teardown restores the exact pre-apply
+  state".
+
+- **Regression round 3 — append-block residue (A3-R3-3)**: teardown removed
+  an emptied CLAUDE.md/AGENTS.md only when the tearing session itself
+  created the file. When the file pre-existed solely as *another session's
+  marked blocks* (multi-role apply in one repo), the last teardown left a
+  0-byte file. Teardown now also removes the emptied file when its pre-apply
+  backup consists entirely of agent-profile marked blocks — the file owes
+  its existence to the tool. A user-owned file (any foreign content,
+  including an intentionally empty pre-existing file) is preserved.

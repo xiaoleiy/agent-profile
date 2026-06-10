@@ -559,15 +559,18 @@ fn print_skipped(s: &Skipped) {
 }
 
 fn cmd_diff(cli: &Cli, rt: &RoleTargetArgs, scope: Scope) -> Result<ExitCode, Error> {
-    let (_ws, _resolved, target, ctx, plan) = build_plan(cli, rt, scope, None)?;
+    let (ws, _resolved, target, ctx, plan) = build_plan(cli, rt, scope, None)?;
+    let ledger = state::load(ws.root())?;
 
     let mut diffs: Vec<(String, String)> = Vec::new();
     for action in &plan.actions {
         let abs = ctx.resolve(action.path());
         let (cur, desired) = match action {
-            // Symlinks diff on their target, not file contents.
+            // Symlinks diff on their resolved target, not file contents.
             Action::Symlink { link_target, .. } => {
+                let want = ctx.resolve(link_target);
                 let cur = match std::fs::read_link(&abs) {
+                    Ok(t) if t == want => symlink_repr(link_target), // clean
                     Ok(t) => symlink_repr(&abbreviate_home(&t, &ctx.home)),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
                     // Exists but is not a symlink — show it as drift.
@@ -584,7 +587,11 @@ fn cmd_diff(cli: &Cli, rt: &RoleTargetArgs, scope: Scope) -> Result<ExitCode, Er
                 // §5.5: apply materializes set `${env:VAR}` refs into a
                 // gitignored `.mcp.json`. diff must compare against the same
                 // materialized content, or it would misread the key it wrote
-                // itself as a foreign collision (regression A3-R2-1).
+                // itself as a foreign collision (regression A3-R2-1). A key
+                // an active session recorded stays OURS even when the
+                // variable is unset/rotated in this shell (A3-R3-1): the
+                // on-disk value is its apply-time materialization, adopted
+                // via state.json instead of misattributed to a third party.
                 let desired = match action {
                     Action::MergeKeys {
                         path,
@@ -593,6 +600,16 @@ fn cmd_diff(cli: &Cli, rt: &RoleTargetArgs, scope: Scope) -> Result<ExitCode, Er
                     } => {
                         let effective = state::resolve_mcp_env(content, &abs, &ctx.repo_root)
                             .unwrap_or_else(|_not_ignored| content.clone());
+                        let records =
+                            state::merge_records_for_path(&ledger.sessions, None, action.path());
+                        let effective = state::adopt_session_owned_values(
+                            &effective,
+                            content,
+                            keys,
+                            current.as_deref(),
+                            &records,
+                            action.path(),
+                        );
                         adapters::desired_file_state(
                             &Action::MergeKeys {
                                 path: path.clone(),

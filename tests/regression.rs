@@ -842,3 +842,411 @@ fn teardown_refcounts_values_shared_with_another_active_session() {
         assert!(p.get("defaultMode").is_none());
     }
 }
+
+// ---------------------------------------------------------------- AREA2-R3-01
+
+/// `apply --force` over a foreign `[mcp_servers.*]` key backs the original up
+/// (§5.1) — and a clean teardown must RESTORE that original from the backup
+/// instead of key-level-removing it (§3.2: "teardown restores the exact
+/// pre-apply state"), matching what the owned-file --force path already does.
+#[test]
+fn forced_merge_over_foreign_mcp_key_round_trips_the_original() {
+    let sb = sandbox_with_examples();
+    let config = sb.home.join(".codex/config.toml");
+    write(
+        &config,
+        "# my config\n[tui]\ntheme = \"dark\"\n\n[mcp_servers.github-readonly]\ncommand = \"someone-elses\"\n",
+    );
+    let original = fs::read_to_string(&config).unwrap();
+
+    // Plain apply refuses the collision (exit 3)…
+    cmd(&sb.home)
+        .current_dir(&sb.repo)
+        .args([
+            "apply",
+            "--role",
+            "reviewer",
+            "--target",
+            "codex-agent",
+            "--session-id",
+            "s1",
+        ])
+        .assert()
+        .code(3);
+    // …--force overrides, still backing up.
+    cmd(&sb.home)
+        .current_dir(&sb.repo)
+        .args([
+            "apply",
+            "--role",
+            "reviewer",
+            "--target",
+            "codex-agent",
+            "--session-id",
+            "s1",
+            "--force",
+        ])
+        .assert()
+        .code(0);
+    let applied = fs::read_to_string(&config).unwrap();
+    assert!(applied.contains("github-mcp"), "force overwrote: {applied}");
+
+    cmd(&sb.home)
+        .current_dir(&sb.repo)
+        .args(["teardown", "--session-id", "s1"])
+        .assert()
+        .code(0);
+    let after = fs::read_to_string(&config).unwrap();
+    assert!(
+        after.contains("command = \"someone-elses\""),
+        "user's pre-apply [mcp_servers.github-readonly] was lost: {after}"
+    );
+    assert_eq!(after, original, "exact pre-apply state restored");
+}
+
+/// Same forced-overwrite round-trip for the JSON merge path (`.mcp.json`).
+#[test]
+fn forced_merge_over_foreign_mcp_json_key_round_trips_the_original() {
+    let sb = sandbox_with_examples();
+    let mcp = sb.repo.join(".mcp.json");
+    write(
+        &mcp,
+        "{\n  \"mcpServers\": {\n    \"github-readonly\": {\n      \"command\": \"someone-elses\"\n    }\n  }\n}\n",
+    );
+    fs::write(
+        sb.repo.join(".gitignore"),
+        ".mcp.json\n.agent-profile/state.json\n.agent-profile/backups/\n",
+    )
+    .unwrap();
+    let original = fs::read_to_string(&mcp).unwrap();
+
+    cmd(&sb.home)
+        .current_dir(&sb.repo)
+        .env("GITHUB_PAT_RO", "x")
+        .args([
+            "apply",
+            "--role",
+            "reviewer",
+            "--target",
+            "claude-teammate",
+            "--session-id",
+            "s1",
+        ])
+        .assert()
+        .code(3);
+    cmd(&sb.home)
+        .current_dir(&sb.repo)
+        .env("GITHUB_PAT_RO", "x")
+        .args([
+            "apply",
+            "--role",
+            "reviewer",
+            "--target",
+            "claude-teammate",
+            "--session-id",
+            "s1",
+            "--force",
+        ])
+        .assert()
+        .code(0);
+    cmd(&sb.home)
+        .current_dir(&sb.repo)
+        .env("GITHUB_PAT_RO", "x")
+        .args(["teardown", "--session-id", "s1"])
+        .assert()
+        .code(0);
+    let after: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&mcp).unwrap()).unwrap();
+    let expected: serde_json::Value = serde_json::from_str(&original).unwrap();
+    assert_eq!(
+        after, expected,
+        "user's pre-apply mcpServers.github-readonly must come back from backup"
+    );
+}
+
+// ---------------------------------------------------------------- A3-R3-1
+
+/// A `${env:VAR}` mcp key this tool applied stays OURS at diff time even when
+/// the variable is unset or rotated in the diffing shell (the common
+/// orchestrator clean-check case): exit 0, no "foreign collision" error, and
+/// `diff --json` emits the diffs envelope — never an error object (§2, §4.6;
+/// §3.2.2 reserves collisions for keys we did not create).
+#[test]
+fn diff_recognizes_own_env_mcp_key_when_var_is_unset_or_rotated() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    let st = std::process::Command::new("git")
+        .current_dir(&repo)
+        .args(["init", "-q"])
+        .status()
+        .unwrap();
+    assert!(st.success());
+    fs::write(
+        repo.join(".gitignore"),
+        ".mcp.json\n.agent-profile/state.json\n.agent-profile/backups/\n",
+    )
+    .unwrap();
+    write(
+        &repo.join(".agent-profile/profiles/r.yaml"),
+        "apiVersion: agent-profile/v1\nname: r\ndescription: d\nrole: r\n\
+         targets: [claude-teammate]\n\
+         mcpServers:\n  gh:\n    type: stdio\n    command: github-mcp\n    env:\n      GITHUB_TOKEN: ${env:TOK}\n",
+    );
+    cmd(&home)
+        .current_dir(&repo)
+        .env("TOK", "ghp_aaaaaaaaaaaaaaaaaaaa")
+        .args([
+            "apply",
+            "--role",
+            "r",
+            "--target",
+            "claude-teammate",
+            "--session-id",
+            "s1",
+        ])
+        .assert()
+        .code(0);
+    // Unset: the post-apply clean check of any fresh shell.
+    cmd(&home)
+        .current_dir(&repo)
+        .env_remove("TOK")
+        .args(["diff", "--role", "r", "--target", "claude-teammate"])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::is_empty());
+    // Rotated: same — state.json proves the key is ours and unchanged.
+    cmd(&home)
+        .current_dir(&repo)
+        .env("TOK", "ghp_bbbbbbbbbbbbbbbbbbbb")
+        .args(["diff", "--role", "r", "--target", "claude-teammate"])
+        .assert()
+        .code(0);
+    // --json must carry the diffs envelope, not an error object.
+    let assert = cmd(&home)
+        .current_dir(&repo)
+        .env_remove("TOK")
+        .args([
+            "diff",
+            "--json",
+            "--role",
+            "r",
+            "--target",
+            "claude-teammate",
+        ])
+        .assert()
+        .code(0);
+    let out: serde_json::Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+    assert!(out.get("error").is_none(), "error envelope: {out}");
+    assert_eq!(out["diffs"], serde_json::json!([]));
+    // And a genuinely foreign key (no session owns it) still collides.
+    cmd(&home)
+        .current_dir(&repo)
+        .env_remove("TOK")
+        .args(["teardown", "--session-id", "s1"])
+        .assert()
+        .code(0);
+    write(
+        &repo.join(".mcp.json"),
+        "{\n  \"mcpServers\": {\n    \"gh\": {\n      \"command\": \"someone-elses\"\n    }\n  }\n}\n",
+    );
+    cmd(&home)
+        .current_dir(&repo)
+        .env_remove("TOK")
+        .args(["diff", "--role", "r", "--target", "claude-teammate"])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("collision"));
+}
+
+// ---------------------------------------------------------------- A3-R3-2
+
+/// A skill that resolves only via the repo fallback
+/// (`.agent-profile/skills/<name>/SKILL.md`, §1.2) must be materialized as a
+/// symlink to that location (§3.2.4) — not as a dangling link into a
+/// nonexistent `~/.agents/skills/<name>` — and diff must be clean after the
+/// apply.
+#[test]
+fn repo_fallback_skill_symlink_points_at_the_resolved_location() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    let st = std::process::Command::new("git")
+        .current_dir(&repo)
+        .args(["init", "-q"])
+        .status()
+        .unwrap();
+    assert!(st.success());
+    fs::write(
+        repo.join(".gitignore"),
+        ".agent-profile/state.json\n.agent-profile/backups/\n",
+    )
+    .unwrap();
+    write(
+        &repo.join(".agent-profile/profiles/r.yaml"),
+        "apiVersion: agent-profile/v1\nname: r\ndescription: d\nrole: r\n\
+         targets: [claude-teammate]\nskills: [fallback-skill]\n",
+    );
+    write(
+        &repo.join(".agent-profile/skills/fallback-skill/SKILL.md"),
+        "# fb\n",
+    );
+    // doctor green-lights the fallback (F051)…
+    cmd(&home)
+        .current_dir(&repo)
+        .args(["doctor", "--role", "r", "--target", "claude-teammate"])
+        .assert()
+        .code(0);
+    // …and render's linkTarget names the resolved location.
+    let assert = cmd(&home)
+        .current_dir(&repo)
+        .args([
+            "render",
+            "--json",
+            "--role",
+            "r",
+            "--target",
+            "claude-teammate",
+        ])
+        .assert()
+        .code(0);
+    let out: serde_json::Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+    let link = out["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["op"] == "symlink")
+        .unwrap();
+    assert_eq!(link["linkTarget"], ".agent-profile/skills/fallback-skill");
+
+    cmd(&home)
+        .current_dir(&repo)
+        .args([
+            "apply",
+            "--role",
+            "r",
+            "--target",
+            "claude-teammate",
+            "--session-id",
+            "f1",
+        ])
+        .assert()
+        .code(0);
+    let link_path = repo.join(".claude/skills/fallback-skill");
+    let target = fs::read_link(&link_path).unwrap();
+    assert!(
+        link_path.join("SKILL.md").exists(),
+        "dangling symlink: {} -> {}",
+        link_path.display(),
+        target.display()
+    );
+    cmd(&home)
+        .current_dir(&repo)
+        .args(["diff", "--role", "r", "--target", "claude-teammate"])
+        .assert()
+        .code(0);
+    cmd(&home)
+        .current_dir(&repo)
+        .args(["teardown", "--session-id", "f1"])
+        .assert()
+        .code(0);
+    assert!(
+        fs::symlink_metadata(&link_path).is_err(),
+        "teardown must remove the fallback-target link"
+    );
+}
+
+// ---------------------------------------------------------------- A3-R3-3
+
+/// Teardown leaves no empty CLAUDE.md residue when the file owes its
+/// existence to this tool (§3.2: "teardown restores the exact pre-apply
+/// state") — including the multi-session case where a later session's backup
+/// contains nothing but an earlier session's marked block. A user-owned
+/// CLAUDE.md is untouched.
+#[test]
+fn teardown_removes_claude_md_it_created_and_keeps_user_owned_one() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    let st = std::process::Command::new("git")
+        .current_dir(&repo)
+        .args(["init", "-q"])
+        .status()
+        .unwrap();
+    assert!(st.success());
+    fs::write(
+        repo.join(".gitignore"),
+        ".agent-profile/state.json\n.agent-profile/backups/\n",
+    )
+    .unwrap();
+    write(&repo.join(".agent-profile/fragments/a.md"), "frag\n");
+    for role in ["r1", "r2"] {
+        write(
+            &repo.join(format!(".agent-profile/profiles/{role}.yaml")),
+            &format!(
+                "apiVersion: agent-profile/v1\nname: {role}\ndescription: d\nrole: {role}\n\
+                 targets: [claude-teammate]\ncontext: [fragments/a.md]\n"
+            ),
+        );
+    }
+    let claude_md = repo.join("CLAUDE.md");
+    let run = |args: &[&str]| {
+        cmd(&home).current_dir(&repo).args(args).assert().code(0);
+    };
+    // Single session: apply created the file → teardown removes it.
+    run(&[
+        "apply",
+        "--role",
+        "r1",
+        "--target",
+        "claude-teammate",
+        "--session-id",
+        "c0",
+    ]);
+    run(&["teardown", "--session-id", "c0"]);
+    assert!(!claude_md.exists(), "single-session residue left behind");
+    // Two sessions: the second saw a file that was only the first's block.
+    run(&[
+        "apply",
+        "--role",
+        "r1",
+        "--target",
+        "claude-teammate",
+        "--session-id",
+        "c1",
+    ]);
+    run(&[
+        "apply",
+        "--role",
+        "r2",
+        "--target",
+        "claude-teammate",
+        "--session-id",
+        "c2",
+    ]);
+    run(&["teardown", "--session-id", "c1"]);
+    run(&["teardown", "--session-id", "c2"]);
+    assert!(
+        !claude_md.exists(),
+        "multi-session 0-byte residue left behind"
+    );
+    // User-owned file: block removed, file (and content) preserved.
+    fs::write(&claude_md, "# mine\n").unwrap();
+    run(&[
+        "apply",
+        "--role",
+        "r1",
+        "--target",
+        "claude-teammate",
+        "--session-id",
+        "c3",
+    ]);
+    run(&["teardown", "--session-id", "c3"]);
+    assert_eq!(fs::read_to_string(&claude_md).unwrap(), "# mine\n");
+}

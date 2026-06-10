@@ -266,6 +266,129 @@ pub fn resolve_mcp_env(content: &str, abs: &Path, repo_root: &Path) -> Result<St
     Ok(substitute_set_env(content))
 }
 
+/// diff support (regression A3-R3-1): a merge key recorded by an active
+/// session is OUR key, not a foreign collision (§3.2.2 reserves collision
+/// errors for "existing keys we did not create"). state.json deliberately
+/// stores the merge fragment UNRESOLVED (§5.5 — never the materialized
+/// secret), so after apply the only faithful comparison is at that level:
+/// when the plan's unresolved value for a key equals the recorded one (the
+/// profile did not change) and the on-disk value still matches the recorded
+/// fragment modulo `${env:VAR}` materialization, the key is clean — even if
+/// the variable is now unset or rotated in the diffing shell. For such keys
+/// the on-disk value is adopted into the effective fragment so the merge
+/// neither errors nor reports a spurious diff. Only JSON files materialize
+/// env references; other paths pass through unchanged.
+pub fn adopt_session_owned_values(
+    effective: &str,
+    unresolved: &str,
+    keys: &[String],
+    current: Option<&str>,
+    records: &[&ActionRecord],
+    path: &str,
+) -> String {
+    if is_toml(path) || records.is_empty() {
+        return effective.to_string();
+    }
+    let Some(current) = current else {
+        return effective.to_string();
+    };
+    let (Ok(cur), Ok(mut eff), Ok(plan)) = (
+        serde_json::from_str::<serde_json::Value>(current),
+        serde_json::from_str::<serde_json::Value>(effective),
+        serde_json::from_str::<serde_json::Value>(unresolved),
+    ) else {
+        return effective.to_string();
+    };
+    for key in keys {
+        if key.contains("[+") {
+            continue; // appended entries are tracked individually
+        }
+        let Some(cur_val) = json_at(&cur, key).cloned() else {
+            continue;
+        };
+        let Some(plan_val) = json_at(&plan, key) else {
+            continue;
+        };
+        let owned_and_clean = records.iter().any(|r| {
+            r.keys
+                .as_ref()
+                .is_some_and(|ks| ks.iter().any(|k| k == key))
+                && r.content.as_ref().is_some_and(|c| {
+                    serde_json::from_str::<serde_json::Value>(c)
+                        .ok()
+                        .and_then(|frag| json_at(&frag, key).cloned())
+                        .is_some_and(|rec_val| {
+                            rec_val == *plan_val && matches_modulo_env(&rec_val, &cur_val)
+                        })
+                })
+        });
+        if owned_and_clean {
+            json_set_at(&mut eff, key, cur_val);
+        }
+    }
+    let mut s = serde_json::to_string_pretty(&eff).expect("JSON value serializes");
+    s.push('\n');
+    s
+}
+
+/// Deep equality between an unresolved spec value and an on-disk value,
+/// treating each `${env:VAR}` reference in spec strings as a wildcard (the
+/// materialized secret is unrecoverable once the variable is unset/rotated).
+fn matches_modulo_env(spec: &serde_json::Value, disk: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match (spec, disk) {
+        (Value::String(s), Value::String(d)) => env_wildcard_match(s, d),
+        (Value::Object(s), Value::Object(d)) => {
+            s.len() == d.len()
+                && s.iter()
+                    .all(|(k, sv)| d.get(k).is_some_and(|dv| matches_modulo_env(sv, dv)))
+        }
+        (Value::Array(s), Value::Array(d)) => {
+            s.len() == d.len()
+                && s.iter()
+                    .zip(d.iter())
+                    .all(|(sv, dv)| matches_modulo_env(sv, dv))
+        }
+        _ => spec == disk,
+    }
+}
+
+/// Does `disk` match `spec` when every `${env:VAR}` in `spec` is a wildcard?
+fn env_wildcard_match(spec: &str, disk: &str) -> bool {
+    let mut literals: Vec<&str> = Vec::new();
+    let mut rest = spec;
+    let mut any_ref = false;
+    while let Some(i) = rest.find("${env:") {
+        match rest[i..].find('}') {
+            Some(j) => {
+                any_ref = true;
+                literals.push(&rest[..i]);
+                rest = &rest[i + j + 1..];
+            }
+            None => break,
+        }
+    }
+    literals.push(rest);
+    if !any_ref {
+        return spec == disk;
+    }
+    let (first, middle_and_last) = literals.split_first().expect("non-empty");
+    let Some(mut hay) = disk.strip_prefix(first) else {
+        return false;
+    };
+    let (last, middles) = middle_and_last.split_last().expect("at least one ref");
+    for lit in middles {
+        if lit.is_empty() {
+            continue; // adjacent wildcards collapse
+        }
+        match hay.find(lit) {
+            Some(p) => hay = &hay[p + lit.len()..],
+            None => return false,
+        }
+    }
+    hay.ends_with(last)
+}
+
 /// Can `abs` end up committed from `repo_root`? Files outside the repo cannot;
 /// inside, `git check-ignore` decides (design §5.5). A non-git directory is
 /// conservatively treated as not ignored.
@@ -477,9 +600,10 @@ struct Executed {
 }
 
 /// The merge-keys records other active sessions hold for `path`, excluding
-/// `skip_id`'s own. This is the cross-session ownership index used both at
-/// apply (shared-claim detection) and at teardown (refcounting).
-fn merge_records_for_path<'a>(
+/// `skip_id`'s own. This is the cross-session ownership index used at apply
+/// (shared-claim detection), at teardown (refcounting), and by diff
+/// (session-owned key recognition, A3-R3-1).
+pub fn merge_records_for_path<'a>(
     sessions: &'a BTreeMap<String, Session>,
     skip_id: Option<&str>,
     path: &str,
@@ -994,7 +1118,20 @@ fn teardown_one(
             let Some(new) = remove_marked_block(&cur, &marker) else {
                 return Ok(None); // block already gone
             };
-            if record.hash_before.is_none() && new.trim().is_empty() {
+            // Remove the file when our block was all that is left AND the
+            // file owes its existence to this tool: apply created it
+            // (no hashBefore), or the pre-apply content was nothing but
+            // agent-profile marked blocks from other sessions since torn
+            // down (regression A3-R3-3 — no 0-byte residue; §3.2 "teardown
+            // restores the exact pre-apply state").
+            let tool_created = record.hash_before.is_none()
+                || backup_abs
+                    .as_deref()
+                    .map(read_opt)
+                    .transpose()?
+                    .flatten()
+                    .is_some_and(|b| only_marked_blocks(&b));
+            if tool_created && new.trim().is_empty() {
                 std::fs::remove_file(abs).map_err(io_err(abs))?;
             } else {
                 atomic_write(abs, &new)?;
@@ -1053,7 +1190,22 @@ fn remove_recorded_keys(
             if key_claimed(claims, key) {
                 continue; // another active session still needs it
             }
-            toml_remove_at(&mut doc, key, &pre);
+            // A key that pre-existed with *different* content was a foreign
+            // value a forced apply overwrote (§5.1: --force still backs up) —
+            // restore the user's original instead of deleting it
+            // (regression AREA2-R3-01). A pre-existing identical value is a
+            // cross-session claim (A3-R2-3/AP4-R2-01): the last session out
+            // removes it.
+            let pre_item = toml_item_at(pre.as_item(), key).cloned();
+            let cur_differs = match (&pre_item, toml_item_at(doc.as_item(), key)) {
+                (Some(p), Some(c)) => p.to_string().trim() != c.to_string().trim(),
+                (Some(_), None) => true,
+                _ => false,
+            };
+            match pre_item {
+                Some(orig) if cur_differs => toml_set_at(&mut doc, key, orig),
+                _ => toml_remove_at(&mut doc, key, &pre),
+            }
         }
         Ok(doc.to_string())
     } else {
@@ -1094,7 +1246,15 @@ fn remove_recorded_keys(
                 if key_claimed(claims, key) {
                     continue; // another active session still needs it
                 }
-                json_remove_at(&mut v, key);
+                // Same forced-overwrite restore as the TOML branch
+                // (regression AREA2-R3-01): a backed-up foreign value comes
+                // back; only values we introduced are removed.
+                match json_at(&pre, key).cloned() {
+                    Some(orig) if json_at(&v, key) != Some(&orig) => {
+                        json_set_at(&mut v, key, orig);
+                    }
+                    _ => json_remove_at(&mut v, key),
+                }
             }
         }
         prune_empty_objects(&mut v, &pre);
@@ -1132,6 +1292,53 @@ fn toml_remove_at(doc: &mut DocMut, dotted: &str, pre: &DocMut) {
             let parent_segs: Vec<&str> = parent.split('.').collect();
             remove_in(doc.as_item_mut(), &parent_segs);
         }
+    }
+}
+
+/// Set `dotted` in `doc` to `value`, creating implicit parent tables as
+/// needed (teardown restore of a force-overwritten key, AREA2-R3-01).
+fn toml_set_at(doc: &mut DocMut, dotted: &str, value: toml_edit::Item) {
+    fn set_in(item: &mut toml_edit::Item, segs: &[&str], value: toml_edit::Item) {
+        let Some(t) = item.as_table_like_mut() else {
+            return;
+        };
+        if segs.len() == 1 {
+            t.insert(segs[0], value);
+            return;
+        }
+        if t.get(segs[0]).is_none() {
+            let mut tbl = toml_edit::Table::new();
+            tbl.set_implicit(true);
+            t.insert(segs[0], toml_edit::Item::Table(tbl));
+        }
+        set_in(
+            t.get_mut(segs[0]).expect("just ensured present"),
+            &segs[1..],
+            value,
+        );
+    }
+    let segs: Vec<&str> = dotted.split('.').collect();
+    set_in(doc.as_item_mut(), &segs, value);
+}
+
+/// Set `dotted` in `v` to `value`, creating parent objects as needed
+/// (teardown restore of a force-overwritten key, AREA2-R3-01).
+fn json_set_at(v: &mut serde_json::Value, dotted: &str, value: serde_json::Value) {
+    let segs: Vec<&str> = dotted.split('.').collect();
+    let Some((leaf, parents)) = segs.split_last() else {
+        return;
+    };
+    let mut cur = v;
+    for seg in parents {
+        let Some(obj) = cur.as_object_mut() else {
+            return;
+        };
+        cur = obj
+            .entry((*seg).to_string())
+            .or_insert_with(|| serde_json::json!({}));
+    }
+    if let Some(obj) = cur.as_object_mut() {
+        obj.insert((*leaf).to_string(), value);
     }
 }
 
@@ -1180,6 +1387,33 @@ fn prune_empty_objects(v: &mut serde_json::Value, pre: &serde_json::Value) {
     for key in to_remove {
         obj.remove(&key);
     }
+}
+
+/// Is `text` (a pre-apply backup) made up entirely of agent-profile marked
+/// blocks (any marker) and blank lines? Such a file exists only because of
+/// this tool's own applies, so teardown may remove it once emptied
+/// (regression A3-R3-3).
+fn only_marked_blocks(text: &str) -> bool {
+    let mut saw_block = false;
+    let mut inside = false;
+    for line in text.lines() {
+        let t = line.trim_start();
+        if !inside && t.starts_with("<!-- agent-profile:begin ") {
+            inside = true;
+            saw_block = true;
+            continue;
+        }
+        if inside {
+            if t.starts_with("<!-- agent-profile:end ") {
+                inside = false;
+            }
+            continue;
+        }
+        if !t.trim_end().is_empty() {
+            return false;
+        }
+    }
+    saw_block && !inside
 }
 
 /// Remove the `<!-- agent-profile:begin <marker> … end <marker> -->` block,
@@ -1457,6 +1691,35 @@ mod tests {
             "merge rolled back from backup"
         );
         assert!(!ctx.workspace_root.join("backups/s1").exists());
+    }
+
+    /// A3-R3-1: unresolved-spec matching — `${env:VAR}` wildcards.
+    #[test]
+    fn env_wildcard_match_treats_refs_as_wildcards() {
+        assert!(env_wildcard_match("${env:TOK}", "ghp_anything"));
+        assert!(env_wildcard_match("Bearer ${env:TOK}", "Bearer abc123"));
+        assert!(!env_wildcard_match("Bearer ${env:TOK}", "Basic abc123"));
+        assert!(env_wildcard_match("${env:A}-${env:B}", "x-y"));
+        assert!(!env_wildcard_match("plain", "different"));
+        assert!(env_wildcard_match("plain", "plain"));
+    }
+
+    /// A3-R3-3: residue detection — pre-apply content that is nothing but
+    /// agent-profile marked blocks means the file owes its existence to us.
+    #[test]
+    fn only_marked_blocks_detects_tool_created_content() {
+        let block = "<!-- agent-profile:begin session=c1 role=r -->\n\
+                     @.agent-profile/fragments/a.md\n\
+                     <!-- agent-profile:end session=c1 -->\n";
+        assert!(only_marked_blocks(block));
+        assert!(only_marked_blocks(&format!("\n{block}\n")));
+        assert!(!only_marked_blocks(&format!("# mine\n{block}")));
+        assert!(!only_marked_blocks(""));
+        assert!(!only_marked_blocks("# just text\n"));
+        // Unterminated block — be conservative.
+        assert!(!only_marked_blocks(
+            "<!-- agent-profile:begin session=c1 -->\nx\n"
+        ));
     }
 
     #[test]
