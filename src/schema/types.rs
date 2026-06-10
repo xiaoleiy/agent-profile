@@ -24,6 +24,15 @@ impl Target {
             Target::CodexAgent => "codex-agent",
         }
     }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "claude-subagent" => Some(Target::ClaudeSubagent),
+            "claude-teammate" => Some(Target::ClaudeTeammate),
+            "codex-agent" => Some(Target::CodexAgent),
+            _ => None,
+        }
+    }
 }
 
 /// Profile-level permission postures (design §1.2).

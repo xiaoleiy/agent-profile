@@ -6,13 +6,17 @@ pub mod resolved;
 
 use std::path::PathBuf;
 
-use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Args, Parser, Subcommand};
 use serde::Serialize;
 
 use crate::JSON_SCHEMA_VERSION;
+use crate::adapters::{self, Action, Plan, PlanContext, Skipped};
 use crate::error::{Error, ExitCode};
+use crate::schema::types::Target;
 use crate::schema::validate::{self, UnitReport};
-use crate::schema::{Workspace, merge};
+use crate::schema::{ResolvedProfile, Workspace, merge};
+
+pub use crate::adapters::Scope;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -35,12 +39,6 @@ pub struct Cli {
     pub verbose: u8,
     #[command(subcommand)]
     pub command: Command,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum Scope {
-    Repo,
-    User,
 }
 
 #[derive(Debug, Args)]
@@ -153,9 +151,13 @@ fn dispatch(cli: &Cli) -> Result<ExitCode, Error> {
         Command::List => cmd_list(cli),
         Command::Show { role, resolved } => cmd_show(cli, role, *resolved),
         Command::Validate { role } => cmd_validate(cli, role.as_deref()),
+        Command::Render {
+            role_target,
+            out,
+            scope,
+        } => cmd_render(cli, role_target, out.as_deref(), *scope),
+        Command::Diff { role_target, scope } => cmd_diff(cli, role_target, *scope),
         Command::Doctor { .. }
-        | Command::Render { .. }
-        | Command::Diff { .. }
         | Command::Apply { .. }
         | Command::Teardown { .. }
         | Command::Current
@@ -364,4 +366,180 @@ fn print_unit_report(report: &UnitReport, quiet: bool) {
 
 fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
+}
+
+// ---------------------------------------------------------------- render / diff
+
+/// Shared front half of render/diff: resolve, check target, plan, denylist.
+fn build_plan(
+    cli: &Cli,
+    rt: &RoleTargetArgs,
+    scope: Scope,
+) -> Result<(ResolvedProfile, Target, PlanContext, Plan), Error> {
+    let ws = workspace(cli)?;
+    let target = Target::parse(&rt.target).ok_or_else(|| Error::UnknownTarget {
+        target: rt.target.clone(),
+    })?;
+    let resolved = merge::resolve(&ws, &rt.role)?;
+    if !resolved.profile.targets.contains(&target) {
+        return Err(Error::TargetNotAllowed {
+            role: rt.role.clone(),
+            target: rt.target.clone(),
+        });
+    }
+    let repo_root = ws.root().parent().unwrap_or(ws.root()).to_path_buf();
+    let home = std::env::home_dir().ok_or_else(|| Error::Io {
+        path: PathBuf::from("~"),
+        source: std::io::Error::other("cannot determine home directory"),
+    })?;
+    let ctx = PlanContext {
+        scope,
+        repo_root,
+        home,
+        session_id: None,
+    };
+    let adapter = adapters::adapter_for(target).ok_or(Error::NotImplemented)?;
+    let plan = adapter.plan(&resolved, &ctx)?;
+    // Hardcoded never-touch denylist — enforced regardless of flags.
+    adapters::denylist::assert_plan_allowed(&plan, &ctx)?;
+    Ok((resolved, target, ctx, plan))
+}
+
+fn cmd_render(
+    cli: &Cli,
+    rt: &RoleTargetArgs,
+    out: Option<&std::path::Path>,
+    scope: Scope,
+) -> Result<ExitCode, Error> {
+    let (_resolved, target, _ctx, plan) = build_plan(cli, rt, scope)?;
+
+    let written = match out {
+        Some(dir) => Some((dir, adapters::materialize(&plan, dir)?.len())),
+        None => None,
+    };
+
+    if cli.json {
+        let mut envelope = serde_json::json!({
+            "schemaVersion": JSON_SCHEMA_VERSION,
+            "role": rt.role,
+            "target": target.as_str(),
+            "actions": plan.actions,
+            "skipped": plan.skipped,
+        });
+        if let Some(dir) = out {
+            envelope["outDir"] = serde_json::json!(dir.display().to_string());
+        }
+        println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
+    } else {
+        print_plan_human(&plan, written);
+    }
+    Ok(ExitCode::Success)
+}
+
+fn print_plan_human(plan: &Plan, written: Option<(&std::path::Path, usize)>) {
+    match written {
+        None => println!("PLAN (dry-run — nothing written):"),
+        Some((dir, _)) => println!(
+            "PLAN (rendered to {} — provider files untouched):",
+            dir.display()
+        ),
+    }
+    let width = plan
+        .actions
+        .iter()
+        .map(|a| a.path().len())
+        .max()
+        .unwrap_or(0)
+        .max(20);
+    for action in &plan.actions {
+        match action {
+            Action::Create { path, content } => println!(
+                "  {:<10}  {path:<width$}  ({} lines)",
+                "create",
+                content.lines().count()
+            ),
+            Action::MergeKeys { path, keys, .. } => {
+                let added = keys
+                    .iter()
+                    .map(|k| format!("+ [{k}]"))
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                println!("  {:<10}  {path:<width$}  {added}", "merge-keys");
+                println!(
+                    "{:14}(key-level merge via toml_edit; comments/format preserved;",
+                    ""
+                );
+                println!("{:14} existing tables untouched)", "");
+            }
+            Action::AppendBlock { path, content, .. } => println!(
+                "  {:<10}  {path:<width$}  marked block ({} lines, @include stub)",
+                "append",
+                content.lines().count()
+            ),
+            Action::Symlink { path, link_target } => {
+                println!("  {:<10}  {path:<width$}  -> {link_target}", "symlink")
+            }
+        }
+    }
+    for s in &plan.skipped {
+        print_skipped(s);
+    }
+    match written {
+        Some((_, n)) => println!("Wrote {n} rendered file{} (sandbox only).", plural(n)),
+        None => println!(
+            "Run `agent-profile render … --out <dir>` to inspect files, or `apply` to write."
+        ),
+    }
+}
+
+fn print_skipped(s: &Skipped) {
+    println!("  skipped {}: {}", s.field, s.reason);
+    if let Some(hint) = &s.hint {
+        println!("          → {hint}");
+    }
+}
+
+fn cmd_diff(cli: &Cli, rt: &RoleTargetArgs, scope: Scope) -> Result<ExitCode, Error> {
+    let (_resolved, target, ctx, plan) = build_plan(cli, rt, scope)?;
+
+    let mut diffs: Vec<(String, String)> = Vec::new();
+    for action in &plan.actions {
+        let abs = ctx.resolve(action.path());
+        let current = match std::fs::read_to_string(&abs) {
+            Ok(s) => Some(s),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(source) => return Err(Error::Io { path: abs, source }),
+        };
+        let desired = adapters::desired_file_state(action, current.as_deref())?;
+        let cur = current.unwrap_or_default();
+        if cur != desired {
+            let text_diff = similar::TextDiff::from_lines(cur.as_str(), desired.as_str());
+            let mut unified = text_diff.unified_diff();
+            unified.context_radius(3).header(action.path(), "rendered");
+            diffs.push((action.path().to_string(), unified.to_string()));
+        }
+    }
+
+    if cli.json {
+        let envelope = serde_json::json!({
+            "schemaVersion": JSON_SCHEMA_VERSION,
+            "role": rt.role,
+            "target": target.as_str(),
+            "diffs": diffs
+                .iter()
+                .map(|(path, diff)| serde_json::json!({ "path": path, "diff": diff }))
+                .collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
+    } else {
+        for (_, diff) in &diffs {
+            print!("{diff}");
+        }
+    }
+    // `git diff --exit-code` semantics, shifted to our code space (design §2).
+    Ok(if diffs.is_empty() {
+        ExitCode::Success
+    } else {
+        ExitCode::Drift
+    })
 }

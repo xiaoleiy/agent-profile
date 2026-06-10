@@ -45,8 +45,25 @@ pub enum Error {
     #[error("unknown role profile `{role}` (no {path} file)")]
     UnknownRole { role: String, path: PathBuf },
 
+    #[error(
+        "unknown target `{target}` (expected one of: claude-subagent, claude-teammate, codex-agent)"
+    )]
+    UnknownTarget { target: String },
+
+    #[error("profile `{role}` does not list target `{target}` in `targets:`")]
+    TargetNotAllowed { role: String, target: String },
+
     #[error("validation failed:\n{}", format_findings(.0))]
     Validation(Vec<Finding>),
+
+    #[error("drift: {0}")]
+    Drift(String),
+
+    #[error("failed to parse TOML at {path}: {message}")]
+    TomlParse { path: PathBuf, message: String },
+
+    #[error("refusing to touch never-touch path {path} (hardcoded denylist, design §5.1)")]
+    NeverTouch { path: PathBuf },
 
     #[error("command not implemented yet (planned for a later sprint)")]
     NotImplemented,
@@ -65,11 +82,19 @@ impl Error {
     /// by `main.rs`.
     pub fn exit_code(&self) -> ExitCode {
         match self {
-            Error::Io { .. } | Error::NotImplemented => ExitCode::Internal,
+            // NeverTouch is an adapter bug surfacing through defense in depth,
+            // not a user error — internal.
+            Error::Io { .. }
+            | Error::NotImplemented
+            | Error::TomlParse { .. }
+            | Error::NeverTouch { .. } => ExitCode::Internal,
             Error::WorkspaceNotFound { .. }
             | Error::WorkspaceDirInvalid { .. }
             | Error::UnknownRole { .. }
+            | Error::UnknownTarget { .. }
+            | Error::TargetNotAllowed { .. }
             | Error::Validation(_) => ExitCode::Validation,
+            Error::Drift(_) => ExitCode::Drift,
         }
     }
 }
@@ -112,5 +137,25 @@ mod tests {
             ExitCode::Validation
         );
         assert_eq!(Error::Validation(vec![]).exit_code(), ExitCode::Validation);
+        assert_eq!(
+            Error::UnknownTarget { target: "x".into() }.exit_code(),
+            ExitCode::Validation
+        );
+        assert_eq!(
+            Error::TargetNotAllowed {
+                role: "r".into(),
+                target: "t".into()
+            }
+            .exit_code(),
+            ExitCode::Validation
+        );
+        assert_eq!(Error::Drift("x".into()).exit_code(), ExitCode::Drift);
+        assert_eq!(
+            Error::NeverTouch {
+                path: PathBuf::from("/x")
+            }
+            .exit_code(),
+            ExitCode::Internal
+        );
     }
 }

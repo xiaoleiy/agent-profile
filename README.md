@@ -26,8 +26,8 @@ and product design principles.
 
 ## Status
 
-Sprint 1 of the MVP is implemented (see `docs/product/sprints.md`). Working
-today, end-to-end on the fixtures in `examples/.agent-profile/`:
+Sprints 1–2 of the MVP are implemented (see `docs/product/sprints.md`).
+Working today, end-to-end on the fixtures in `examples/.agent-profile/`:
 
 - **Profile schema v1** (`apiVersion: agent-profile/v1`): strict parsing
   (unknown keys are errors), capability blocks restricted to
@@ -41,15 +41,37 @@ today, end-to-end on the fixtures in `examples/.agent-profile/`:
 - **Commands**: `validate [--role <r>]`, `list`, `show --role <r>
   [--resolved]` (with `# from: <file>` provenance comments). All support
   `--json` (`schemaVersion: 1`) and `--dir`.
+- **`render --role <r> --target codex-agent [--scope repo|user] [--out <dir>]`**:
+  dry-run by default — prints the plan (owned agent TOML, key-level
+  `[mcp_servers.*]` merge into `~/.codex/config.toml` via `toml_edit`, marked
+  `@include` block for `AGENTS.md`) and SKIPPED lines for anything the target
+  cannot express (e.g. non-Bash tool rules, skills). There is deliberately no
+  `--dry-run` flag; the only way render touches disk is `--out <sandbox-dir>`.
+- **`diff --role <r> --target codex-agent`**: rendered plan vs what is on disk;
+  unified diff per path; exit 3 when differences exist (script-gate semantics,
+  like `git diff --exit-code`).
+- **Canonical tool grammar** (`Tool`, `Tool(spec)`, `Bash(cmd:*)`,
+  `mcp__server__tool`) with `Bash(...)` → Codex `prefix_rule(...)` translation;
+  untranslatable rules are surfaced, never silently dropped.
+- **Never-touch denylist**: `~/.claude.json`, `~/.claude/settings.json`, plugin
+  registries, `auth.json`, caches/history — hardcoded below the adapters; no
+  flag bypasses it.
+
+Try it (writes only into the sandbox directory you name):
 
 ```bash
 cargo run -- validate --dir examples/.agent-profile
 cargo run -- show --role reviewer --resolved --dir examples/.agent-profile
+cargo run -- render --role implementer --target codex-agent --dir examples/.agent-profile
+cargo run -- render --role implementer --target codex-agent \
+  --dir examples/.agent-profile --out /tmp/agent-profile-out
+cargo run -- diff --role implementer --target codex-agent --dir examples/.agent-profile
 ```
 
-Not yet implemented (exit 1 with a "not implemented" message): `doctor`,
-`render`, `diff`, `apply`, `teardown`, `current`, `completions` — these land
-in sprints S2–S5 per the sprint plan.
+Not yet implemented (exit 1 with a "not implemented" message): the
+`claude-subagent`/`claude-teammate` render targets, `doctor`, `apply`,
+`teardown`, `current`, `completions` — these land in sprints S3–S5 per the
+sprint plan.
 
 Exit codes follow the design contract: 0 success, 1 internal error,
 2 validation failure, 3 drift, 4 doctor errors, 5 session/state error.

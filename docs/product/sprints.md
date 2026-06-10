@@ -174,3 +174,19 @@ steps beyond the tag push; probe scorecard live and dated.
   where included blocks supply surviving keys and the resolved view
   attributes keys to two blocks and the profile. `reviewer` is still
   asserted to render provenance comments (`# from: profiles/reviewer.yaml`).
+
+- **S2-T3 wording "into the scoped config.toml"**: the design doc wins on
+  conflict, and design §4.6 shows a *default (repo) scope* render merging
+  `[mcp_servers.*]` into `~/.codex/config.toml`; the recon doc (§2) likewise
+  only observed MCP servers in the global config. The codex-agent adapter
+  therefore always targets `~/.codex/config.toml` for the MCP merge
+  (key-level, toml_edit). `--scope user` still relocates the *owned* files
+  (`~/.codex/agents/<role>.toml`, `~/.codex/AGENTS.md` for the marked block).
+
+- **S2-T3 prefix_rule string representation**: `toml_edit` serializes string
+  values containing double quotes as TOML *literal strings*
+  (`'prefix_rule(pattern=["git","diff"], decision="allow")'`) rather than the
+  escaped basic strings shown in design §3.3.1. The parsed value is
+  character-identical to the design's; tests assert the exact rule text. The
+  golden test for §4.6 asserts file list, ops, and key names as specified
+  (line counts naturally differ from the illustrative `(19 lines)`).

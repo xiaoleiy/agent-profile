@@ -71,10 +71,21 @@ fn unimplemented_commands_exit_1() {
         .assert()
         .code(1)
         .stderr(predicate::str::contains("not implemented"));
+    // Claude render targets land in S3 — listed in qa's `targets:` but the
+    // adapter is not implemented yet.
     cmd(tmp.path())
-        .args(["render", "--role", "qa", "--target", "claude-subagent"])
+        .args([
+            "render",
+            "--role",
+            "qa",
+            "--target",
+            "claude-subagent",
+            "--dir",
+        ])
+        .arg(examples_dir())
         .assert()
-        .code(1);
+        .code(1)
+        .stderr(predicate::str::contains("not implemented"));
 }
 
 #[test]
@@ -428,4 +439,404 @@ fn show_unknown_role_exits_2() {
         .arg(examples_dir())
         .assert()
         .code(2);
+}
+
+// ---------------------------------------------------------------- S2 render
+
+/// A self-contained codex-targeted workspace used by render/diff tests.
+const WORKER_PROFILE: &str = "\
+apiVersion: agent-profile/v1
+name: worker
+description: Codex worker.
+role: worker
+targets: [codex-agent]
+model:
+  codex: gpt-5.5
+  effort: medium
+permissionMode: acceptEdits
+tools:
+  allow: [\"Bash(cargo test:*)\", Read]
+  deny: [\"Bash(git push:*)\"]
+mcpServers:
+  github:
+    command: github-mcp
+    env:
+      GITHUB_TOKEN: ${env:GITHUB_PAT_RW}
+context: [fragments/worker-notes.md]
+";
+
+fn worker_workspace() -> TempDir {
+    workspace(&[
+        ("profiles/worker.yaml", WORKER_PROFILE),
+        ("fragments/worker-notes.md", "Be a good worker.\n"),
+    ])
+}
+
+/// Sorted (relative-path, contents) snapshot of a directory tree.
+fn snapshot(root: &Path) -> Vec<(String, String)> {
+    fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, root, out);
+            } else {
+                let rel = path.strip_prefix(root).unwrap().display().to_string();
+                out.push((rel, fs::read_to_string(&path).unwrap_or_default()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+#[test]
+fn render_implementer_codex_matches_design_walkthrough() {
+    let home = TempDir::new().unwrap();
+    let assert = cmd(home.path())
+        .args([
+            "render",
+            "--role",
+            "implementer",
+            "--target",
+            "codex-agent",
+            "--dir",
+        ])
+        .arg(examples_dir())
+        .assert()
+        .code(0);
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    // §4.6 shape: file list, ops, key names.
+    assert!(
+        out.starts_with("PLAN (dry-run — nothing written):"),
+        "{out}"
+    );
+    assert!(out.contains("create"), "{out}");
+    assert!(out.contains(".codex/agents/implementer.toml"), "{out}");
+    assert!(out.contains("merge-keys"), "{out}");
+    assert!(out.contains("~/.codex/config.toml"), "{out}");
+    assert!(out.contains("+ [mcp_servers.github]"), "{out}");
+    assert!(out.contains("key-level merge via toml_edit"), "{out}");
+    assert!(out.contains("append"), "{out}");
+    assert!(out.contains("AGENTS.md"), "{out}");
+    assert!(
+        out.contains("marked block (3 lines, @include stub)"),
+        "{out}"
+    );
+    // Inexpressible fields are surfaced, never silently dropped.
+    assert!(out.contains("skipped tools.allow: `Read`"), "{out}");
+    assert!(out.contains("skipped skills:"), "{out}");
+    // Dry-run footer from §4.1.
+    assert!(
+        out.contains(
+            "Run `agent-profile render … --out <dir>` to inspect files, or `apply` to write."
+        ),
+        "{out}"
+    );
+}
+
+#[test]
+fn render_rejects_target_not_in_profile_targets() {
+    let home = TempDir::new().unwrap();
+    // qa targets only [claude-subagent, claude-teammate].
+    cmd(home.path())
+        .args(["render", "--role", "qa", "--target", "codex-agent", "--dir"])
+        .arg(examples_dir())
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "does not list target `codex-agent`",
+        ));
+}
+
+#[test]
+fn render_unknown_target_exits_2() {
+    let home = TempDir::new().unwrap();
+    cmd(home.path())
+        .args(["render", "--role", "qa", "--target", "cursor", "--dir"])
+        .arg(examples_dir())
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("unknown target `cursor`"));
+}
+
+#[test]
+fn render_json_matches_design_contract() {
+    let home = TempDir::new().unwrap();
+    let assert = cmd(home.path())
+        .args([
+            "render",
+            "--json",
+            "--role",
+            "implementer",
+            "--target",
+            "codex-agent",
+            "--dir",
+        ])
+        .arg(examples_dir())
+        .assert()
+        .code(0);
+    let json: serde_json::Value =
+        serde_json::from_slice(&assert.get_output().stdout).expect("valid JSON");
+    assert_eq!(json["schemaVersion"], 1);
+    assert_eq!(json["role"], "implementer");
+    assert_eq!(json["target"], "codex-agent");
+    let actions = json["actions"].as_array().unwrap();
+    assert_eq!(actions[0]["op"], "create");
+    assert_eq!(actions[0]["path"], ".codex/agents/implementer.toml");
+    assert!(
+        actions[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("name = \"implementer\"")
+    );
+    assert_eq!(actions[1]["op"], "merge-keys");
+    assert_eq!(actions[1]["path"], "~/.codex/config.toml");
+    assert_eq!(actions[1]["keys"][0], "mcp_servers.github");
+    assert_eq!(actions[2]["op"], "append-block");
+    assert_eq!(actions[2]["path"], "AGENTS.md");
+    assert!(
+        json["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["field"] == "skills")
+    );
+}
+
+#[test]
+fn render_out_writes_sandbox_dir_and_touches_nothing_else() {
+    let home = TempDir::new().unwrap();
+    let ws = worker_workspace();
+    let out = TempDir::new().unwrap();
+
+    let ws_before = snapshot(ws.path());
+    let home_before = snapshot(home.path());
+
+    cmd(home.path())
+        .args([
+            "render",
+            "--role",
+            "worker",
+            "--target",
+            "codex-agent",
+            "--dir",
+        ])
+        .arg(ws.path().join(".agent-profile"))
+        .arg("--out")
+        .arg(out.path())
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("provider files untouched"));
+
+    // Workspace and sandbox HOME are byte-identical — only --out was written.
+    assert_eq!(snapshot(ws.path()), ws_before);
+    assert_eq!(snapshot(home.path()), home_before);
+
+    let rendered = snapshot(out.path());
+    let paths: Vec<&str> = rendered.iter().map(|(p, _)| p.as_str()).collect();
+    assert_eq!(
+        paths,
+        [
+            ".codex/agents/worker.toml",
+            ".codex/config.toml",
+            "AGENTS.md"
+        ]
+    );
+    let agent = &rendered[0].1;
+    assert!(agent.starts_with("# generated by agent-profile v"));
+    assert!(agent.contains("name = \"worker\""));
+    let config_fragment = &rendered[1].1;
+    assert!(config_fragment.contains("[mcp_servers.github]"));
+    assert!(config_fragment.contains("GITHUB_TOKEN = \"${env:GITHUB_PAT_RW}\""));
+    let agents_md = &rendered[2].1;
+    assert!(agents_md.contains("<!-- agent-profile:begin role=worker -->"));
+    assert!(agents_md.contains("@.agent-profile/fragments/worker-notes.md"));
+}
+
+// ---------------------------------------------------------------- S2 diff
+
+#[test]
+fn diff_against_empty_repo_exits_3_showing_creates() {
+    let home = TempDir::new().unwrap();
+    let ws = worker_workspace();
+    let assert = cmd(home.path())
+        .args([
+            "diff",
+            "--role",
+            "worker",
+            "--target",
+            "codex-agent",
+            "--dir",
+        ])
+        .arg(ws.path().join(".agent-profile"))
+        .assert()
+        .code(3);
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(out.contains("--- .codex/agents/worker.toml"), "{out}");
+    assert!(out.contains("+++ rendered"), "{out}");
+    assert!(out.contains("+name = \"worker\""), "{out}");
+    assert!(out.contains("--- ~/.codex/config.toml"), "{out}");
+    assert!(out.contains("+[mcp_servers.github]"), "{out}");
+    assert!(out.contains("--- AGENTS.md"), "{out}");
+}
+
+#[test]
+fn diff_after_placing_identical_rendered_output_exits_0() {
+    let home = TempDir::new().unwrap();
+    let ws = worker_workspace();
+    let out = TempDir::new().unwrap();
+
+    cmd(home.path())
+        .args([
+            "render",
+            "--role",
+            "worker",
+            "--target",
+            "codex-agent",
+            "--dir",
+        ])
+        .arg(ws.path().join(".agent-profile"))
+        .arg("--out")
+        .arg(out.path())
+        .assert()
+        .code(0);
+
+    // Manually place the rendered output where the plan expects it.
+    let copy = |from: &str, to: PathBuf| {
+        fs::create_dir_all(to.parent().unwrap()).unwrap();
+        fs::copy(out.path().join(from), to).unwrap();
+    };
+    copy(
+        ".codex/agents/worker.toml",
+        ws.path().join(".codex/agents/worker.toml"),
+    );
+    copy(".codex/config.toml", home.path().join(".codex/config.toml"));
+    copy("AGENTS.md", ws.path().join("AGENTS.md"));
+
+    cmd(home.path())
+        .args([
+            "diff",
+            "--role",
+            "worker",
+            "--target",
+            "codex-agent",
+            "--dir",
+        ])
+        .arg(ws.path().join(".agent-profile"))
+        .assert()
+        .code(0)
+        .stdout(predicate::str::is_empty());
+}
+
+#[test]
+fn diff_merge_keys_shows_only_added_toml_keys() {
+    let home = TempDir::new().unwrap();
+    let ws = worker_workspace();
+    let existing = "\
+# personal codex config
+model = \"gpt-5.5\"
+
+[marketplaces.official]
+source_type = \"git\"
+
+[projects.\"/x\"]
+trust_level = \"trusted\"
+";
+    fs::create_dir_all(home.path().join(".codex")).unwrap();
+    fs::write(home.path().join(".codex/config.toml"), existing).unwrap();
+
+    let assert = cmd(home.path())
+        .args([
+            "diff",
+            "--role",
+            "worker",
+            "--target",
+            "codex-agent",
+            "--dir",
+        ])
+        .arg(ws.path().join(".agent-profile"))
+        .assert()
+        .code(3);
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    // §4.6: only the added mcp_servers keys appear — no removals, no churn
+    // of the comment/marketplaces/projects content Codex owns.
+    assert!(out.contains("+[mcp_servers.github]"), "{out}");
+    assert!(out.contains("+command = \"github-mcp\""), "{out}");
+    assert!(
+        out.contains("+GITHUB_TOKEN = \"${env:GITHUB_PAT_RW}\""),
+        "{out}"
+    );
+    let removals: Vec<&str> = out
+        .lines()
+        .filter(|l| l.starts_with('-') && !l.starts_with("---"))
+        .collect();
+    assert!(removals.is_empty(), "no removals expected: {removals:?}");
+}
+
+#[test]
+fn diff_json_lists_diffs_per_path() {
+    let home = TempDir::new().unwrap();
+    let ws = worker_workspace();
+    let assert = cmd(home.path())
+        .args([
+            "diff",
+            "--json",
+            "--role",
+            "worker",
+            "--target",
+            "codex-agent",
+            "--dir",
+        ])
+        .arg(ws.path().join(".agent-profile"))
+        .assert()
+        .code(3);
+    let json: serde_json::Value =
+        serde_json::from_slice(&assert.get_output().stdout).expect("valid JSON");
+    assert_eq!(json["schemaVersion"], 1);
+    let diffs = json["diffs"].as_array().unwrap();
+    let paths: Vec<&str> = diffs.iter().map(|d| d["path"].as_str().unwrap()).collect();
+    assert_eq!(
+        paths,
+        [
+            ".codex/agents/worker.toml",
+            "~/.codex/config.toml",
+            "AGENTS.md"
+        ]
+    );
+    assert!(
+        diffs[1]["diff"]
+            .as_str()
+            .unwrap()
+            .contains("+[mcp_servers.github]")
+    );
+}
+
+#[test]
+fn diff_mcp_key_collision_is_drift_exit_3() {
+    let home = TempDir::new().unwrap();
+    let ws = worker_workspace();
+    fs::create_dir_all(home.path().join(".codex")).unwrap();
+    fs::write(
+        home.path().join(".codex/config.toml"),
+        "[mcp_servers.github]\ncommand = \"someone-elses-mcp\"\n",
+    )
+    .unwrap();
+    cmd(home.path())
+        .args([
+            "diff",
+            "--role",
+            "worker",
+            "--target",
+            "codex-agent",
+            "--dir",
+        ])
+        .arg(ws.path().join(".agent-profile"))
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains(
+            "merge collision at `mcp_servers.github",
+        ))
+        .stderr(predicate::str::contains("not created by agent-profile"));
 }
