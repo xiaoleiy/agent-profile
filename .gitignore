@@ -1,0 +1,4 @@
+target/
+.agent-profile/state.json
+.agent-profile/backups/
+.DS_Store
